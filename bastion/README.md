@@ -24,6 +24,7 @@
 | 06_video_valid_origin.py | v2 | 9e021d3a |
 | 07_event_master.py | v1 | 3a12cead |
 | 08_0920_lineage.py | v1 | 5e54ed0f |
+| 09_provenance_bruteforce.py | v1 | 0d99804c |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
@@ -63,3 +64,6 @@
   5. 在 switch 平台表里查找 0920 的事件，看 0920 是不是"switch 事件中 acc ≤ −2"的那部分；
   6. 找出列名和 0920 大量重合的中间表，按修改时间排序；
   7. 找出代码里给这些列赋值的行。
+- **09_provenance_bruteforce.py**：暴力追查 0920 的来源，扫描范围是 C 盘和 D 盘。分两部分：
+  - **A 部分**：找出所有带 vin 列和时间列的表，只读这两列，数一数每张表里包含多少个 0920 事件（按 VIN + 精确到秒的时间匹配，UTC 与北京时间的 ±8 小时也算进去）。按包含情况把表分成三类：上游（超集）、同源、部分包含，每类按修改时间列出。
+  - **B 部分**：在代码和文档里搜 0920 特有的列名和文件名，列出命中文件的读写语句。
