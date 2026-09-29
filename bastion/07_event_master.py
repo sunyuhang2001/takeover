@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # 07_event_master.py : 事件主表 + V/T/R/D 组合计数（只读 02/03/05 的输出，不再读原始数据）
-#   V=自车视频  T=自车轨迹  Rv=龙门架视频  Rj=participant json  D=原因描述(0920)
+#   V=有ch1(前视)的自车视频  Vgrade=三通道/有ch1/无ch1/无视频  T=自车轨迹  Rv=龙门架视频  Rj=participant json  D=原因描述(0920)
 #   可复现 U = (T 且 R) 或 V 或 Rv
 import os, sys, re, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "07_event_master", "v1"
+NAME, VERSION = "07_event_master", "v2"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\07_master"
 RADIUS_M = 200      # 事件位置离路口多近算"在路侧覆盖内"
@@ -89,6 +89,13 @@ def main():
     off["D"] = 0; off["V"] = 1; off["cross_name1"] = ""
     cols = ["eid", "src", "vin", "t_sec", "V", "T", "T_shift", "D", "chans", "cross_name1"]
     ev = pd.concat([e9[cols], off[cols]], ignore_index=True)
+    # ch1=车头前方 ch2=座舱 ch3=踏板：至少要有 ch1 才算"有视频"，三个都有最好
+    ch = ev.chans.fillna("").astype(str).str.replace(".0", "", regex=False)
+    ev["chans"] = ch
+    ev["V_any"] = (ch != "").astype(int)
+    ev["V"] = ch.str.contains("1").astype(int)
+    ev["Vgrade"] = np.select([ch.str.contains("1") & ch.str.contains("2") & ch.str.contains("3"),
+                              ch.str.contains("1"), ch != ""], ["三通道", "有ch1", "无ch1"], "无视频")
     ev["lat"], ev["lon"] = locate(ev, H)
 
     # ---------- 路口坐标：用 0920 事件(有cross_name1且定位成功)反推 ----------
@@ -111,7 +118,7 @@ def main():
     RS = RS.merge(dup, on=["vin", "sec"], how="left", indicator=True)
     RS = RS[RS._merge == "left_only"]
     rsev = pd.DataFrame({"eid": ["R%04d" % i for i in range(len(RS))], "src": "traj_switch", "vin": RS.vin.values,
-                         "t_sec": RS.sec.values, "V": 0, "T": 1, "T_shift": "0", "D": 0, "chans": "",
+                         "t_sec": RS.sec.values, "V": 0, "V_any": 0, "Vgrade": "无视频", "T": 1, "T_shift": "0", "D": 0, "chans": "",
                          "cross_name1": "", "lat": pd.to_numeric(RS.lat, errors="coerce").values,
                          "lon": pd.to_numeric(RS.lon, errors="coerce").values, "xn": ""})
     ev = pd.concat([ev, rsev], ignore_index=True)
@@ -152,6 +159,8 @@ def main():
             return "C 仅视频"
         if r["T"]:
             return "D2 轨迹+路侧" if r.R else "D1 仅自车轨迹"
+        if r.V_any:
+            return "F 仅无ch1视频(不可用)"
         return "E 仅原因"
     ev["cat"] = ev.apply(cat, axis=1)
     ev.to_csv(OUT_DIR + r"\event_master.csv", index=False, encoding="utf-8-sig")
@@ -170,13 +179,24 @@ def main():
         out("  %-22s %5d  %5d   %4d (%d/%d)   %s ~ %s" % (c, len(d), d.U.sum(), d.R.sum(), d.Rv.sum(), d.Rj.sum(),
                                                        d.t.min().strftime("%Y-%m-%d"), d.t.max().strftime("%Y-%m-%d")))
     out("")
-    out("V T R D 组合:")
+    out("分类 x 视频等级:")
+    ct = pd.crosstab(ev["cat"], ev.Vgrade)
+    out("  %-22s " % "" + " ".join("%6s" % c for c in ct.columns))
+    for idx, r in ct.iterrows():
+        out("  %-22s " % idx + " ".join("%6d" % v for v in r.values))
+    nc1 = ev[ev.Vgrade == "无ch1"]
+    out("有视频但无ch1(不算V)=%d: 有轨迹=%d 有路侧=%d 有原因=%d  通道: %s" % (
+        len(nc1), nc1["T"].sum(), nc1.R.sum(), nc1.D.sum(),
+        " ".join("ch%s:%d" % (k, v) for k, v in nc1.chans.value_counts().items())))
+    out("")
+    out("V T R D 组合 (V=有ch1):")
     comb = ev.groupby(["V", "T", "R", "D"]).size().reset_index(name="n").sort_values("n", ascending=False)
     for r in comb.itertuples():
         out("  V=%d T=%d R=%d D=%d : %d" % (r.V, r[2], r.R, r.D, r.n))
     out("")
     v = ev[ev.V == 1]
-    out("视频事件 通道组合 x 有轨迹:  " + "  ".join("ch%s:%d/%d" % (k, d["T"].sum(), len(d)) for k, d in v.groupby(v.chans.fillna("?").astype(str))))
+    va = ev[ev.V_any == 1]
+    out("视频事件 通道组合 有轨迹/总数:  " + "  ".join("ch%s:%d/%d" % (k, d["T"].sum(), len(d)) for k, d in va.groupby("chans")))
     out("有路侧的事件 按路口(Rv): " + "  ".join("%s:%d" % (k, n) for k, n in ev[ev.Rv == 1].Rv_inter.value_counts().head(8).items()))
     out("有路侧的事件 按来源: " + "  ".join("%s:%d" % (k, n) for k, n in ev[ev.R == 1].src.value_counts().items()))
     c_only = ev[ev["cat"] == "C 仅视频"]
