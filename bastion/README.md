@@ -21,7 +21,7 @@
 | 03_roadside.py | v1 | 4177224e |
 | 04_table_catalog.py | v1 | 91a08f0e |
 | 05_traj_coverage.py | v1 | 3d97bd4f |
-| 06_video_valid_origin.py | v1 | b38b9d47 |
+| 06_video_valid_origin.py | v2 | 9e021d3a |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 

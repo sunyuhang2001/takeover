@@ -6,7 +6,7 @@
 import os, sys, re, hashlib, time
 import pandas as pd
 
-NAME, VERSION = "06_video_valid_origin", "v1"
+NAME, VERSION = "06_video_valid_origin", "v2"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\06_video_valid"
 CODE_EXT = {".py", ".ipynb", ".m", ".sql", ".md", ".txt", ".r", ".sh", ".bat", ".json", ".yaml", ".yml", ".ini", ".cfg"}
@@ -52,9 +52,48 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     out("=== %s %s  check=%s  %s ===" % (NAME, VERSION, selfcheck(), time.strftime("%Y-%m-%d %H:%M")))
 
-    # ---------------- 1) 搜代码 ----------------
     fi = pd.read_csv(BASE + r"\01_scan\file_index.csv", dtype=str, keep_default_na=False)
     fi["size_bytes"] = pd.to_numeric(fi.size_bytes, errors="coerce").fillna(0)
+
+    # ---------------- 0) 0920 表的来历 ----------------
+    import zipfile
+    src = fi[fi.name.str.contains("脱离事件汇总") & ~fi.dir.str.lower().str.contains("takeover_audit")].sort_values("mtime")
+    out("[0920 文件] 共%d份 (按修改时间; xlsx内部元数据: 作者/最后修改人/创建/修改)" % len(src))
+    for d, n, sz, mt in zip(src.dir, src.name, src.size_bytes, src.mtime):
+        p = d + "\\" + n
+        meta = ""
+        if n.lower().endswith((".xlsx", ".xlsm")):
+            try:
+                x = zipfile.ZipFile(p).read("docProps/core.xml").decode("utf-8", "replace")
+                g = lambda tag: (re.search(r"<%s[^>]*>([^<]*)</%s>" % (tag, tag), x) or [None, ""])[1]
+                meta = "作者=%s 修改人=%s 创建=%s 修改=%s" % (g("dc:creator"), g("cp:lastModifiedBy"),
+                                                       g("dcterms:created")[:16], g("dcterms:modified")[:16])
+            except Exception as e:
+                meta = "meta err %s" % repr(e)[:40]
+        out("   %s  %6.2fMB  %s" % (mt, sz / 2**20, p[-70:]))
+        if meta:
+            out("        " + meta)
+    prev = fi[fi.dir.str.contains("堡垒机数据筛选") & fi.ext.isin({".py", ".md"})]
+    out("")
+    out("[前人脚本] %d个 .py/.md，提到 0920/脱离事件汇总/有效视频/读写excel 的行:" % len(prev))
+    KEY = ("0920", "脱离事件汇总", "有效视频", "video_ava", "read_excel", "to_excel", "read_csv", "to_csv")
+    shown = 0
+    for d, n in zip(prev.dir, prev.name):
+        try:
+            t = read_text(d + "\\" + n)
+        except Exception:
+            continue
+        ls = [(i + 1, l.strip()) for i, l in enumerate(t.splitlines()) if any(k in l for k in KEY)]
+        if not ls:
+            continue
+        out("   # " + n)
+        for i, l in ls[:5]:
+            out("     L%-4d %s" % (i, l[:140])); shown += 1
+        if shown > 30:
+            break
+    out("")
+
+    # ---------------- 1) 搜代码 ----------------
     low_dir = fi.dir.str.lower()
     code = fi[fi.ext.isin(CODE_EXT) & (fi.size_bytes <= MAX_MB * 2**20)
               & ~low_dir.str.contains(r"takeover_audit|site-packages|\\.vscode|node_modules|appdata|miniconda|pycharm|\\.git")]
