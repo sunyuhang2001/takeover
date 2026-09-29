@@ -21,6 +21,7 @@
 | 03_roadside.py | v1 | 4177224e |
 | 04_table_catalog.py | v1 | 91a08f0e |
 | 05_traj_coverage.py | v1 | 3d97bd4f |
+| 06_video_valid_origin.py | v1 | b38b9d47 |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
@@ -44,3 +45,6 @@
     - 路侧时段内、落在路口范围里的点。
   - 自动判断时区，分别用不偏移、+8h、−8h 去对，看哪种能对上。
   - 输出：每个视频事件、每个 0920 事件是否有轨迹（事件前后 30 秒内至少有 20 个不同的秒）；路侧时段里有哪些车，以及 drive_mode 从 1 变 0 的接管次数。
+- **06_video_valid_origin.py**：追查"有效视频"是怎么判定的，分两部分：
+  - 在全盘的代码和文档（.py / .ipynb / .m / .sql / .md / .txt 等）里搜 `有效视频`、`video_avaliable` 等关键词，列出命中的文件和具体代码行；
+  - 统计所有带 video_avaliable 列的表：各取值的分布、对应的事件数、时间范围。
