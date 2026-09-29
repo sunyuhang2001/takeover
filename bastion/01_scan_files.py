@@ -5,7 +5,7 @@
 import os, sys, re, csv, time, hashlib
 from collections import defaultdict
 
-NAME, VERSION = "01_scan_files", "v1"
+NAME, VERSION = "01_scan_files", "v2"
 OUT_DIR = r"D:\takeover_audit\01_scan"
 
 SKIP_DIRS = {  # 目录名（小写）命中即跳过
@@ -14,7 +14,7 @@ SKIP_DIRS = {  # 目录名（小写）命中即跳过
     "matlab", "microsoft vs code", "pycharm", "wps", "node_modules", ".git", "site-packages",
     "__pycache__", "takeover_audit", "tslearn-main",
 }
-VIDEO_EXT = {".avi", ".mp4", ".mkv", ".mov", ".h264", ".h265", ".264", ".ts", ".flv", ".wmv", ".dav"}
+VIDEO_EXT = {".avi", ".mp4", ".mkv", ".mov", ".h264", ".h265", ".264", ".flv", ".wmv", ".dav"}
 TABLE_EXT = {".xlsx", ".xls", ".xlsm", ".csv"}
 ARCH_EXT = {".zip", ".rar", ".7z", ".tar", ".gz"}
 DATA_EXT = {".db", ".sqlite", ".sql", ".parquet", ".mat", ".pcd", ".bag", ".pcap", ".npy", ".pkl", ".h5", ".feather"}
