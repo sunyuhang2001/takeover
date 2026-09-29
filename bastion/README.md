@@ -23,7 +23,7 @@
 | 05_traj_coverage.py | v1 | 3d97bd4f |
 | 06_video_valid_origin.py | v2 | 9e021d3a |
 | 07_event_master.py | v2 | 2e547a62 |
-| 08_0920_lineage.py | v1 | 5e54ed0f |
+| 08_0920_lineage.py | v2 | 5373781a |
 | 09_provenance_bruteforce.py | v1 | 0d99804c |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。

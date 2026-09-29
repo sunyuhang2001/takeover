@@ -9,7 +9,7 @@ import os, sys, re, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "08_0920_lineage", "v1"
+NAME, VERSION = "08_0920_lineage", "v2"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\08_lineage"
 MATCH_S = 60
@@ -134,10 +134,14 @@ def main():
     if a9:
         tr = read_any(a9[0])
         out("[4] all927: %s  行=%d  列=%s" % (a9[0][-50:], len(tr), ",".join(map(str, tr.columns))[:160]))
-        tcol = "dis_engage_time" if "dis_engage_time" in tr.columns else None
+        tcol = next((c for c in ("dis_engage_time", "position_time", "positiontime", "position_time_sql") if c in tr.columns), None)
         tr["ts"] = to_sec(tr[tcol]) if tcol else np.nan
         tr["t0"] = to_sec(tr["disengage_time"])
         tr["dt"] = tr.ts - tr.t0
+        med = tr.dt.median()
+        if pd.notna(med) and abs(med) > 4 * 3600:          # 逐行时间是 UTC 时补 8h
+            tr["dt"] = tr.dt + (8 * 3600 if med < 0 else -8 * 3600)
+        out("    逐行时间列=%s  与disengage_time差的中位=%.0fs(修正后 %.0fs)" % (tcol, med, tr.dt.median()))
         tr["vin"] = tr.vin.astype(str).str.upper().str.strip()
         ev["vin_"] = ev.vin.astype(str).str.upper().str.strip()
         ev["t0"] = to_sec(ev.disengage_time)
@@ -206,6 +210,17 @@ def main():
         if "manual_reason" in S.columns:
             out("    manual_reason: " + " ".join("%s:%d" % (str(k)[:12], v) for k, v in S.manual_reason.value_counts().head(8).items()))
         S = S.sort_values("ts")
+        for sh, lab in ((0, "0"), (8 * 3600, "+8h"), (-8 * 3600, "-8h")):
+            Ss = S.assign(ts=S.ts + sh).dropna(subset=["ts"]).sort_values("ts")
+            mm = pd.merge_asof(ev.sort_values("t0").dropna(subset=["t0"]), Ss[["vin", "ts"]], left_on="t0", right_on="ts",
+                               left_by="vin_", right_by="vin", direction="nearest")
+            dd = (mm.ts - mm.t0).abs()
+            out("    偏移%-4s 找得到(±%ds)=%d  0s=%d  <=5s=%d" % (lab, MATCH_S, (dd <= MATCH_S).sum(), (dd == 0).sum(), (dd <= 5).sum()))
+        best_sh = max(((0, "0"), (8 * 3600, "+8h"), (-8 * 3600, "-8h")), key=lambda x: (
+            (pd.merge_asof(ev.sort_values("t0").dropna(subset=["t0"]), S.assign(ts=S.ts + x[0]).dropna(subset=["ts"]).sort_values("ts")[["vin", "ts"]],
+                           left_on="t0", right_on="ts", left_by="vin_", right_by="vin", direction="nearest").eval("abs(ts - t0)") <= 5).sum()))
+        out("    采用偏移 %s" % best_sh[1])
+        S = S.assign(ts=S.ts + best_sh[0]).sort_values("ts")
         m = pd.merge_asof(ev.sort_values("t0").dropna(subset=["t0"]), S[["vin", "ts", "mode_switch_acceleration_min", "drive_mode_switch"]].dropna(subset=["ts"]),
                           left_on="t0", right_on="ts", by=None, left_by="vin_", right_by="vin", direction="nearest")
         m["dt"] = (m.ts - m.t0)
