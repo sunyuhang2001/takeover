@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 12_verify_all.py v4 : 从头独立重做 + 严格校验 + 事件资产表(2025年前) + 2025年单独一套(同样的分类)（只读）
+# 12_verify_all.py v5 : 从头独立重做 + 严格校验 + 事件资产表(2025年前) + 2025年单独一套(同样的分类)（只读）
 #   事件唯一索引 event_key = VIN_YYYYMMDD_HHMMSS(北京时间)；同VIN相差<=60s 视为同一事件
 #   主表(2025年前) = 自车视频 ∪ 0920 ∪ NPY关键脱离 ∪ 龙门架案例 ∪ 路侧时段内轨迹接管(2025年前)
 #   2025表 = 2025年全部表格轨迹中的 drive_mode 1->0 接管 ∪ 2025年的龙门架案例 ∪ 其他来源落在2025年的事件
@@ -11,7 +11,7 @@ import os, sys, re, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "12_verify_all", "v4"
+NAME, VERSION = "12_verify_all", "v5"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\12_verify"
 ROOTS = ["C:\\", "D:\\"]
@@ -29,7 +29,8 @@ MAP_EXT = {".osm", ".xodr", ".shp", ".geojson", ".kml", ".kmz", ".gpkg", ".mbtil
 MAP_KEYS = ("地图", "瓦片", "卫图", "xodr", "opendrive", "hdmap", "高精", "路网")
 MERGE_S = 60      # 同VIN、时间相差<=60s 视为同一事件
 HALF = 30         # 轨迹覆盖窗口 ±30s
-T_MIN = 20        # ±30s 内 >=20 个不同秒(或 NPY >=20 帧) 算"有轨迹"
+T_MIN = 20        # ±30s 内有效覆盖 >=20s(或 NPY >=20 帧) 算"有轨迹"
+GAP_OK = 5        # 相邻点间隔 <=5s 才算连续覆盖(13 诊断: add_type.csv 约1点/分钟, 只能定位不能复现)
 PAD = 90
 SHIFTS = (0, 8 * 3600, -8 * 3600)
 RS_RADIUS = 500   # 路侧json设备与事件距离(m)
@@ -84,6 +85,15 @@ def to_sec(s):
     except TypeError:
         t = pd.to_datetime(s.astype(str), errors="coerce", format="mixed")
     return ((t - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).astype("float")
+
+
+def cover(sec):
+    """有效覆盖秒 = 1 + 相邻点间隔(<=GAP_OK 的部分)之和；逐秒 61 点=61，2s 采样 16 点=31，1点/分钟≈1"""
+    a = np.unique(np.asarray(sec, dtype=np.int64))
+    if not len(a):
+        return 0
+    d = np.diff(a)
+    return int(1 + d[d <= GAP_OK].sum())
 
 
 def sec2str(x):
@@ -569,19 +579,20 @@ def main():
             dayset.setdefault(v, set()).add(dday)
         rows = []
         for idx, r in U.iterrows():
-            rec = dict(轨迹_秒=0, 轨迹_原始文件="", 轨迹_源数=0, 轨迹_全部源="", 轨迹_偏移="", 轨迹_采样s=np.nan, 跳变_偏差s=np.nan,
+            rec = dict(轨迹_秒=0, 轨迹_点数=0, 轨迹_原始文件="", 轨迹_源数=0, 轨迹_全部源="", 轨迹_偏移="", 轨迹_采样s=np.nan, 跳变_偏差s=np.nan,
                        lat=np.nan, lon=np.nan, NPY帧=0, NPY文件="", NPY行=-1)
             g = Hg.get(r.vin)
             if g is not None:
                 x = g[(g.sec - r.sec).abs() <= HALF]
                 if len(x):
-                    per = x.groupby("file").sec.nunique().reset_index(name="n")
+                    per = x.groupby("file").sec.apply(cover).reset_index(name="n")
+                    per["pts"] = x.groupby("file").sec.nunique().values
                     per["rank"] = per.file.map(rank)
                     per = per.sort_values(["n", "rank"], ascending=[False, True])
                     bf = per.file.iloc[0]
                     xb = x[x.file == bf].drop_duplicates("sec").sort_values("sec")
                     nb = xb.iloc[(xb.sec - r.sec).abs().argsort()[:3]]
-                    rec.update(轨迹_秒=int(per.n.iloc[0]), 轨迹_原始文件=bf, 轨迹_源数=len(per),
+                    rec.update(轨迹_秒=int(per.n.iloc[0]), 轨迹_点数=int(per.pts.iloc[0]), 轨迹_原始文件=bf, 轨迹_源数=len(per),
                                轨迹_全部源="; ".join("%s(%d)" % (f, n) for f, n in zip(per.file.head(5), per.n.head(5))),
                                轨迹_偏移="%+dh" % (int(xb["shift"].iloc[0]) // 3600), lat=nb.lat.median(), lon=nb.lon.median(),
                                轨迹_采样s=float(np.median(np.diff(xb.sec.values))) if len(xb) > 1 else np.nan)
@@ -606,7 +617,7 @@ def main():
         U["有NPY轨迹"] = U.NPY帧 >= T_MIN
         U["有轨迹"] = U.有表格轨迹 | U.有NPY轨迹
         U["轨迹类型"] = np.select([U.有表格轨迹 & U.有NPY轨迹, U.有表格轨迹, U.有NPY轨迹, U.轨迹_秒 > 0],
-                               ["表格+NPY", "表格(逐秒)", "NPY(31帧)", "表格(不足20s)"], "无")
+                               ["表格+NPY", "表格(连续)", "NPY(31帧)", "表格(稀疏/不足20s)"], "无")
         out("")
         out("[9] 轨迹: 事件±30s覆盖秒 0:%d 1-19:%d 20-49:%d >=50:%d ; NPY帧>=20:%d" % (
             (U.轨迹_秒 == 0).sum(), U.轨迹_秒.between(1, 19).sum(), U.轨迹_秒.between(20, 49).sum(), (U.轨迹_秒 >= 50).sum(), U.有NPY轨迹.sum()))
@@ -618,7 +629,7 @@ def main():
             tv.跳变_偏差s.notna().sum(), (tv.跳变_偏差s.abs() <= 5).sum(), (tv.跳变_偏差s.abs() <= 30).sum()))
         out("    最佳表格轨迹来源(原始地址, 事件数):")
         for f, n in tv.轨迹_原始文件.value_counts().head(8).items():
-            out("       %5d  %s" % (n, f[-90:]))
+            out("       %5d  %s" % (n, f))
         if U.有NPY轨迹.any():
             out("    NPY轨迹来源: " + "  ".join("%s:%d" % (f[-60:], n) for f, n in U[U.有NPY轨迹].NPY文件.value_counts().head(3).items()))
 
@@ -664,8 +675,8 @@ def main():
             [has1 & U.有轨迹 & U["在0920"], has1 & U.有轨迹 & ~U["在0920"], has1 & ~U.有轨迹,
              (U.ch2_可读 + U.ch3_可读 > 0) & ~has1, hasv & (U["通道(可读)"] == ""),
              U.有轨迹 & U.有路侧, U.有轨迹, U["在0920"]],
-            ["A 视频ch1+轨迹+原因", "B 视频ch1+轨迹,无原因", "C 视频ch1,无轨迹", "D 仅ch2/ch3视频", "X 视频全部不可读",
-             "E 无视频,轨迹+路侧", "F 无视频,仅自车轨迹", "G 仅0920记录(无轨迹)"], "H 仅NPY/案例(无轨迹)")
+            ["A 视频ch1+轨迹+原因", "B 视频ch1+轨迹,无原因", "C 视频ch1,无连续轨迹", "D 仅ch2/ch3视频", "X 视频全部不可读",
+             "E 无视频,轨迹+路侧", "F 无视频,仅自车轨迹", "G 仅0920记录(无轨迹)"], "H 无视频,无连续轨迹")
         front = ["event_key", "vin", "日期", "事件时间", "来源", "类别", "通道(可读)", "ch1_可读", "ch2_可读", "ch3_可读",
                  "有轨迹", "轨迹类型", "轨迹_秒", "NPY帧", "轨迹_采样s", "轨迹_偏移", "跳变_偏差s", "当天有表格轨迹",
                  "轨迹_原始文件", "轨迹_全部源", "NPY文件", "NPY行", "在0920", "前人35", "NPY全部脱离", "NPY关键脱离", "有路侧"]
@@ -674,7 +685,12 @@ def main():
         try:
             U.drop(columns=["sec"], errors="ignore").to_excel(OUT_DIR + "\\" + fname + ".xlsx", index=False)
         except Exception as e:
-            out("xlsx 写出失败 %r" % e)
+            alt = OUT_DIR + "\\" + fname + time.strftime("_%H%M%S") + ".xlsx"
+            try:
+                U.drop(columns=["sec"], errors="ignore").to_excel(alt, index=False)
+                out("xlsx 被占用(%r), 已另存 %s" % (e, alt))
+            except Exception as e2:
+                out("xlsx 写出失败 %r / %r (csv 已写出)" % (e, e2))
 
         # ================= 12. 统计 =================
         out("")
@@ -695,8 +711,11 @@ def main():
                 g.有表格轨迹.sum(), g.有NPY轨迹.sum(), g.有路侧.sum(), g.日期.min(), g.日期.max()))
         check("分类合计=事件数", U["类别"].value_counts().sum() == len(U))
         nt = U[~U.有轨迹 & (U.veid >= 0)]
-        out("  有视频但无轨迹的事件=%d: 当天该车有表格轨迹=%d(疑似时间未对齐,需人工核)  当天完全无数据=%d  有不足20s的片段=%d" % (
-            len(nt), nt.当天有表格轨迹.sum(), (~nt.当天有表格轨迹).sum(), (nt.轨迹_秒 > 0).sum()))
+        out("  有视频但无连续轨迹的事件=%d: ±30s内只有稀疏点=%d(点数中位=%d, 只能定位不能复现)  ±30s内无点但当天有=%d  当天完全无数据=%d" % (
+            len(nt), (nt.轨迹_点数 > 0).sum(), nt[nt.轨迹_点数 > 0].轨迹_点数.median() if (nt.轨迹_点数 > 0).any() else 0,
+            ((nt.轨迹_点数 == 0) & nt.当天有表格轨迹).sum(), (~nt.当天有表格轨迹).sum()))
+        for f, n in nt[nt.轨迹_点数 > 0].轨迹_原始文件.value_counts().head(3).items():
+            out("     稀疏点来源 %4d  %s" % (n, f))
         out("  前人35=%d ; 视频事件: 在0920=%d  清单外有ch1+轨迹=%d  清单外仅ch1无轨迹=%d" % (U["前人35"].sum(),
             (U["在0920"] & (U.veid >= 0)).sum(), (~U["在0920"] & has1 & U.有轨迹).sum(), (~U["在0920"] & has1 & ~U.有轨迹).sum()))
         ab = U[U["类别"].str[0].isin(["A", "B"]) & U.有表格轨迹 & U.跳变_偏差s.notna()]
@@ -730,7 +749,7 @@ def main():
             tf = g[g.有表格轨迹].轨迹_原始文件.value_counts().head(2)
             out("  %s" % c)
             out("     视频: %s" % (" ".join("%s:%d" % (a, b) for a, b in vd.items()) or "-"))
-            out("     轨迹: %s%s" % (" ; ".join("%s(%d)" % (a[-70:], b) for a, b in tf.items()) or "-",
+            out("     轨迹: %s%s" % (" ; ".join("%s(%d)" % (a, b) for a, b in tf.items()) or "-",
                                   ("  + NPY:%d" % g.有NPY轨迹.sum()) if g.有NPY轨迹.any() else ""))
         out("  索引: event_key = VIN_YYYYMMDD_HHMMSS(北京时间), 同VIN相差<=60s 归为同一事件")
         out("  视频: 路径中的VIN + 文件名 ch{1|2|3}_{起}_{止}; 多副本取原始目录那份, 其余副本列在 ch*_全部副本")
