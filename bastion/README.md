@@ -25,6 +25,7 @@
 | 07_event_master.py | v2 | 2e547a62 |
 | 08_0920_lineage.py | v2 | 5373781a |
 | 09_provenance_bruteforce.py | v1 | 0d99804c |
+| 10_npy_events.py | v1 | bbd7c289 |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
@@ -68,3 +69,7 @@
 - **09_provenance_bruteforce.py**：暴力追查 0920 的来源，扫描范围是 C 盘和 D 盘。分两部分：
   - **A 部分**：找出所有带 vin 列和时间列的表，只读这两列，数一数每张表里包含多少个 0920 事件（按 VIN + 精确到秒的时间匹配，UTC 与北京时间的 ±8 小时也算进去）。按包含情况把表分成三类：上游（超集）、同源、部分包含，每类按修改时间列出。
   - **B 部分**：在代码和文档里搜 0920 特有的列名和文件名，列出命中文件的读写语句。
+- **10_npy_events.py**：盘点全盘的 .npy / .npz 文件，也就是脱离样本 takeover_periods 和 labels。
+  - 自动识别 labels：找出含 vin、时间和经纬度的二维数组。
+  - 用 labels 还原出"全部脱离事件"清单，然后和 0920、自车视频事件比对重合情况；0920 和视频事件都会尝试 ±8h 时区偏移。
+  - 顺带列出 processing_data 的目录结构。
