@@ -22,6 +22,7 @@
 | 04_table_catalog.py | v1 | 91a08f0e |
 | 05_traj_coverage.py | v1 | 3d97bd4f |
 | 06_video_valid_origin.py | v2 | 9e021d3a |
+| 07_event_master.py | v1 | 3a12cead |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
@@ -48,3 +49,8 @@
 - **06_video_valid_origin.py**：追查"有效视频"是怎么判定的，分两部分：
   - 在全盘的代码和文档（.py / .ipynb / .m / .sql / .md / .txt 等）里搜 `有效视频`、`video_avaliable` 等关键词，列出命中的文件和具体代码行；
   - 统计所有带 video_avaliable 列的表：各取值的分布、对应的事件数、时间范围。
+- **07_event_master.py**：只读 02、03、05 的输出，不再读原始数据，几秒钟就能跑完。
+  - **用哪些事件**：0920 表的事件、清单外的视频事件，以及路侧时段内从轨迹里找到的接管。
+  - **路口坐标**：用 0920 表的 cross_name1，加上事件时刻的轨迹点反推出来。
+  - **打标志**：给每个事件打 V、T、Rv、Rj、D、U 六个标志，并归入 A、B、C、D1、D2、E 类。"R"（路侧）的判定条件是：时间上有重叠，并且离路口不超过 200 m、案例目录里的 VIN 一致、路口名一致三者满足其一。
+  - **输出**：事件主表（csv 和 xlsx）、各种组合的计数、各路口的坐标。
