@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
-# 12_verify_all.py v2 : 从头独立重做 + 严格校验 + 事件资产表（只读）
-#   事件唯一索引 = VIN + 事件时间(北京时间, 精确到秒)  -> event_key = VIN_YYYYMMDD_HHMMSS
-#   事件全集 = 自车视频事件 ∪ 0920台账 ∪ NPY关键脱离(critical_label*) ∪ 龙门架案例目录
-#   每个事件逐项列出资产：ch1前视/ch2座舱/ch3踏板(逐文件可读性/时长/副本/路径)、0920原因与标签、
-#   各轨迹源覆盖秒数/采样/时区/drive_mode跳变、NPY(全部脱离/关键脱离)、路侧(参与者/车辆轨迹/交通流/信号/事件/龙门架)
+# 12_verify_all.py v3 : 从头独立重做 + 严格校验 + 事件资产表 + 路侧/2025 专项（只读）
+#   事件唯一索引 event_key = VIN_YYYYMMDD_HHMMSS(北京时间)；同VIN相差<=60s 视为同一事件
+#   事件全集 = 自车视频 ∪ 0920 ∪ NPY关键脱离 ∪ 龙门架案例目录 ∪ 路侧覆盖时段内轨迹里的接管
+#   轨迹 = 表格轨迹(逐秒) 或 NPY 31帧样本(labels 与同目录同样本数的3维数组按行配对)
+#   地址一律取原始位置：处理产物目录(堡垒机数据筛选/takeover_audit)与桌面拷贝排在最后
 # 仍使用 04 的 table_catalog.csv 找轨迹表；其余全部重新扫盘、重新读原始文件
 # 用法: python 12_verify_all.py [根目录...]   (默认 C:\ D:\)
 import os, sys, re, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "12_verify_all", "v2"
+NAME, VERSION = "12_verify_all", "v3"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\12_verify"
 ROOTS = ["C:\\", "D:\\"]
 SKIP = {"windows", "program files", "program files (x86)", "programdata", "$recycle.bin", "system volume information",
         "appdata", "miniconda3", "anaconda3", "matlab", "microsoft vs code", "pycharm", "wps", "node_modules", ".git",
         "site-packages", "takeover_audit"}
+DERIVED = ("堡垒机数据筛选", "takeover_audit")          # 处理产物目录：不作为原始地址
 RE_EGO = re.compile(r"^ch([123])_(\d{12})_(\d{12})\.(avi|mp4|mkv|h264)$", re.I)
 RE_GV = re.compile(r"^(\d+)_(.+?)_(\d{14})-(\d{14})\.mp4$", re.I)
 RE_RS = re.compile(r"^(participant|vehicle_track|traffic_flow|signal|event|camera_url)_(\d{14})-(\d{14})\.json$", re.I)
@@ -27,10 +28,11 @@ MAP_EXT = {".osm", ".xodr", ".shp", ".geojson", ".kml", ".kmz", ".gpkg", ".mbtil
 MAP_KEYS = ("地图", "瓦片", "卫图", "xodr", "opendrive", "hdmap", "高精", "路网")
 MERGE_S = 60      # 同VIN、时间相差<=60s 视为同一事件
 HALF = 30         # 轨迹覆盖窗口 ±30s
-T_MIN = 20        # ±30s 内 >=20 个不同秒有经纬度 算"有轨迹"
+T_MIN = 20        # ±30s 内 >=20 个不同秒(或 NPY >=20 帧) 算"有轨迹"
 PAD = 90
 SHIFTS = (0, 8 * 3600, -8 * 3600)
-RS_RADIUS = 500
+RS_RADIUS = 500   # 路侧json设备与事件距离(m)
+RS_NEAR = 300     # 路侧专项：自车离设备<=300m 算在覆盖内
 CHECKS = []
 
 
@@ -55,6 +57,14 @@ def check(name, ok, detail=""):
     out("  [%s] %s  %s" % ("PASS" if ok else "FAIL", name, detail))
 
 
+def rank(p):
+    """原始地址优先级：0=原始, 1=桌面拷贝, 2=处理产物"""
+    pl = str(p).lower().replace("/", "\\")
+    if any(k.lower() in pl for k in DERIVED):
+        return 2
+    return 1 if "\\desktop\\" in pl else 0
+
+
 def to_sec(s):
     s = pd.Series(s)
     if s.dtype.kind == "M":
@@ -76,6 +86,10 @@ def to_sec(s):
 
 def sec2str(x):
     return "" if pd.isna(x) else str(pd.to_datetime(x, unit="s"))
+
+
+def dist(la1, lo1, la2, lo2):
+    return np.hypot((np.asarray(la1, float) - la2) * 111320, (np.asarray(lo1, float) - lo2) * 111320 * np.cos(np.radians(31.3)))
 
 
 def walk(root):
@@ -131,7 +145,7 @@ def nearest(a, b, tol):
 
 
 def npy_labels(path):
-    """读 labels 类 npy：返回 DataFrame(vin, sec) 或 None"""
+    """labels 类 npy -> DataFrame(vin, sec, row)；并找同目录同样本数的3维数组作为 31 帧轨迹"""
     try:
         a = np.load(path, allow_pickle=True)
     except Exception:
@@ -144,7 +158,28 @@ def npy_labels(path):
     tc = next((c for c in df.columns if c != vc and to_sec(head[c]).between(1.5e9, 1.9e9).mean() > .8), None)
     if vc is None or tc is None:
         return None
-    return pd.DataFrame({"vin": df[vc].astype(str).str.upper().str.strip(), "sec": to_sec(df[tc])}).dropna()
+    partner = ""
+    d = os.path.dirname(path)
+    for f in sorted(os.listdir(d)):
+        if f.lower().endswith(".npy") and os.path.join(d, f) != path:
+            try:
+                x = np.load(os.path.join(d, f), mmap_mode="r")
+                if x.ndim == 3 and x.shape[0] == a.shape[0]:
+                    partner = os.path.join(d, f); break
+            except Exception:
+                pass
+    return pd.DataFrame({"vin": df[vc].astype(str).str.upper().str.strip(), "sec": to_sec(df[tc]),
+                         "row": np.arange(len(df)), "src": path, "partner": partner}).dropna(subset=["sec"])
+
+
+def npy_frames(partner, row):
+    """3维样本中这一行有多少帧不全为0/NaN"""
+    try:
+        x = np.load(partner, mmap_mode="r")[int(row)]
+        x = np.asarray(x, dtype=float)
+        return int((np.nan_to_num(np.abs(x)).sum(axis=1) > 0).sum()), x.shape[0]
+    except Exception:
+        return 0, 0
 
 
 def main():
@@ -189,18 +224,20 @@ def main():
                 maps.append(dict(dir=d, name=n, size=sz, ext=ext))
     E = pd.DataFrame(ego)
     E["path"] = [os.path.join(a, b) for a, b in zip(E.dir, E.name)]
+    E["rank"] = E.path.map(rank)
     E["start"] = pd.to_datetime(E.s, format="%y%m%d%H%M%S", errors="coerce")
     E["end"] = pd.to_datetime(E.e, format="%y%m%d%H%M%S", errors="coerce")
-    out("[1] 扫盘%.0fs: 自车视频=%d 龙门架=%d 路侧json=%d 地图类=%d labels.npy=%d 0920候选=%d 命名不符的ch视频=%d" % (
-        time.time() - t00, len(E), len(gant), len(rsj), len(maps), len(npys), len(e9files), unk))
+    out("[1] 扫盘%.0fs: 自车视频=%d(其中处理产物拷贝=%d) 龙门架=%d 路侧json=%d 地图类=%d labels.npy=%d 0920候选=%d 命名不符ch视频=%d" % (
+        time.time() - t00, len(E), (E["rank"] == 2).sum(), len(gant), len(rsj), len(maps), len(npys), len(e9files), unk))
     check("自车视频文件名都能解析时间", E.start.notna().all() and E.end.notna().all(), "失败=%d" % (E.start.isna() | E.end.isna()).sum())
-    check("自车视频路径都含VIN", (E.vin != "").all(), "无VIN=%d(无法建索引,单列)" % (E.vin == "").sum())
+    check("自车视频路径都含VIN", (E.vin != "").all(), "无VIN=%d(无法建索引,单列在clips.csv)" % (E.vin == "").sum())
 
-    # ================= 2. 逐片段检查 =================
-    clip = E.groupby(["vin", "ch", "start", "end"]).agg(copies=("path", "size"), smin=("size", "min"), smax=("size", "max"),
-                                                        dirs=("dir", lambda s: " | ".join(sorted(set(s))))).reset_index()
-    rep = E.sort_values("size", ascending=False).drop_duplicates(["vin", "ch", "start", "end"]).set_index(["vin", "ch", "start", "end"]).path
-    clip["path"] = [rep.loc[k] for k in zip(clip.vin, clip.ch, clip.start, clip.end)]
+    # ================= 2. 逐片段检查(代表文件取原始地址) =================
+    key4 = ["vin", "ch", "start", "end"]
+    E = E.sort_values(["rank", "size"], ascending=[True, False])
+    clip = E.groupby(key4, sort=False).agg(copies=("path", "size"), smin=("size", "min"), smax=("size", "max"),
+                                           path=("path", "first"), rank=("rank", "first"),
+                                           all_paths=("path", lambda s: " | ".join(s))).reset_index()
     clip["dur_name"] = (clip.end - clip.start).dt.total_seconds()
     t0 = time.time()
     probes = [video_probe(p) for p in clip.path]
@@ -214,15 +251,19 @@ def main():
         clip["dur"] = clip.dur_name
         clip["dur_ok"] = True
     out("")
-    out("[2] 片段=%d 有多份拷贝=%d 拷贝大小不一致=%d 可读=%d 不可读=%d 时长符合=%d  (cv2=%s, %.0fs)" % (
+    out("[2] 片段=%d 有多份拷贝=%d 拷贝大小不一致=%d 可读=%d 不可读=%d 实测时长与文件名相符(±5s)=%d  代表文件取自处理产物=%d  (cv2=%s, %.0fs)" % (
         len(clip), (clip.copies > 1).sum(), (clip.smin != clip.smax).sum(), clip.ok.sum(), (~clip.ok).sum(),
-        (clip.ok & clip.dur_ok).sum(), has_cv, time.time() - t0))
+        (clip.ok & clip.dur_ok).sum(), (clip["rank"] == 2).sum(), has_cv, time.time() - t0))
     for c in "123":
         x = clip[clip.ch == c]
-        out("    ch%s(%s): 片段=%d 可读=%d 总时长=%.1fh  名义时长: %s" % (c, {"1": "前视", "2": "座舱", "3": "踏板"}[c], len(x), x.ok.sum(),
+        out("    ch%s(%s): 片段=%d 可读=%d 实测总时长=%.1fh  文件名时长: %s" % (c, {"1": "前视", "2": "座舱", "3": "踏板"}[c], len(x), x.ok.sum(),
             x[x.ok].dur.sum() / 3600, " ".join("%ds:%d" % (k, v) for k, v in x.dur_name.value_counts().head(4).items())))
-    check("拷贝大小一致", (clip.smin == clip.smax).all(), "不一致=%d(取最大)" % (clip.smin != clip.smax).sum())
-    check("片段全部可读", clip.ok.all(), "不可读=%d" % (~clip.ok).sum())
+    if has_cv:
+        bad = clip[clip.ok & ~clip.dur_ok]
+        out("    时长不符的片段=%d: 实测-文件名 差值分布(s): %s" % (len(bad), " ".join(
+            "%s:%d" % (k, v) for k, v in pd.cut(bad.dur - bad.dur_name, [-1e9, -60, -10, -5, 5, 10, 60, 1e9]).value_counts().sort_index().items())))
+    check("拷贝大小一致", (clip.smin == clip.smax).all(), "不一致=%d(代表文件优先原始目录)" % (clip.smin != clip.smax).sum())
+    check("片段全部可读", clip.ok.all(), "不可读=%d(见clips.csv)" % (~clip.ok).sum())
     clip.to_csv(OUT_DIR + r"\clips.csv", index=False, encoding="utf-8-sig")
 
     # ================= 3. 视频事件 =================
@@ -245,7 +286,8 @@ def main():
             rec["ch%s_可读" % c] = int(x.ok.sum())
             rec["ch%s_时长s" % c] = float(x[x.ok].dur.sum())
             rec["ch%s_副本" % c] = int(x.copies.sum())
-            rec["ch%s_路径" % c] = ";".join(x.path)
+            rec["ch%s_原始路径" % c] = ";".join(x.path)
+            rec["ch%s_全部副本" % c] = " || ".join(x.all_paths)
         rows.append(rec)
     V = pd.DataFrame(rows)
     V["sec"] = to_sec(V.mid)
@@ -258,20 +300,19 @@ def main():
     out("    通道组合(可读):   " + "  ".join("ch%s:%d" % (a if a else "-", b) for a, b in V["通道(可读)"].value_counts().items()))
 
     # ================= 4. 0920 =================
-    e9p = sorted(e9files, key=os.path.getmtime)[0]
+    e9p = sorted(e9files, key=lambda p: (rank(p), os.path.getmtime(p)))[0]
     e9 = pd.read_excel(e9p, sheet_name=0)
     e9["vin"] = e9["vin"].astype(str).str.upper().str.strip()
     e9["sec"] = to_sec(e9["disengage_time"])
     e9["e9_row"] = np.arange(len(e9)) + 2
     vi = nearest(e9[["vin", "sec"]], V[["vin", "sec"]], MERGE_S)
     for i in e9.index[vi < 0]:
-        g = V[(V.vin == e9.at[i, "vin"]) & (V.sec - (V.mid - V.v_start).dt.total_seconds() - 5 <= e9.at[i, "sec"]) &
-              (e9.at[i, "sec"] <= V.sec + (V.v_end - V.mid).dt.total_seconds() + 5)]
+        g = V[(V.vin == e9.at[i, "vin"]) & (to_sec(V.v_start) - 5 <= e9.at[i, "sec"]) & (e9.at[i, "sec"] <= to_sec(V.v_end) + 5)]
         if len(g):
             vi.at[i] = g.index[0]
     e9["vidx"] = vi
     out("")
-    out("[4] 0920: %s 行=%d  有视频=%d" % (e9p[-45:], len(e9), (e9.vidx >= 0).sum()))
+    out("[4] 0920(原始): %s 行=%d  有视频=%d" % (e9p[-60:], len(e9), (e9.vidx >= 0).sum()))
     check("一个视频事件至多对应一条0920", (e9[e9.vidx >= 0].vidx.value_counts() <= 1).all())
     in9 = V.loc[e9[e9.vidx >= 0].vidx]
     n123 = (in9["通道(文件)"] == "123").sum()
@@ -286,152 +327,27 @@ def main():
         check("与前人输出目录一致", avis == 3 * n123 and set(vdirs) == ours,
               "前人VIN=%d avi=%d ; 本次VIN=%d avi应为%d" % (len(vdirs), avis, len(ours), 3 * n123))
 
-    # ================= 5. 事件全集(唯一索引) =================
-    U = pd.DataFrame({"vin": V.vin, "sec": V.sec, "来源": "视频", "veid": V.veid, "e9_row": -1})
-    m9 = e9[e9.vidx >= 0]
-    U.loc[m9.vidx.values, "sec"] = m9.sec.values          # 有0920的，以0920时间为准
-    U.loc[m9.vidx.values, "来源"] = "视频+0920"
-    U.loc[m9.vidx.values, "e9_row"] = m9.e9_row.values
-    add = e9[e9.vidx < 0]
-    U = pd.concat([U, pd.DataFrame({"vin": add.vin, "sec": add.sec, "来源": "0920", "veid": -1, "e9_row": add.e9_row})], ignore_index=True)
-    lab_all, lab_crit = [], []
-    for p in npys:
-        d = npy_labels(p)
-        if d is None:
-            continue
-        (lab_crit if os.path.basename(p).lower().startswith("critical") else lab_all).append(d.assign(src=p))
-    CR = pd.concat(lab_crit).drop_duplicates(["vin", "sec"]).reset_index(drop=True) if lab_crit else pd.DataFrame(columns=["vin", "sec", "src"])
-    AL = pd.concat(lab_all).drop_duplicates(["vin", "sec"]).reset_index(drop=True) if lab_all else pd.DataFrame(columns=["vin", "sec", "src"])
-    ci = nearest(CR, U, MERGE_S)
-    U = pd.concat([U, pd.DataFrame({"vin": CR.vin[ci < 0], "sec": CR.sec[ci < 0], "来源": "NPY关键脱离", "veid": -1, "e9_row": -1})], ignore_index=True)
+    # ================= 5. NPY / 龙门架 / 路侧 基础数据 =================
+    labs = [x for x in (npy_labels(p) for p in npys) if x is not None]
+    isc = lambda df: os.path.basename(df.src.iloc[0]).lower().startswith("critical")
+    CR = pd.concat([x for x in labs if isc(x)]).sort_values("src", key=lambda s: s.map(rank)).drop_duplicates(["vin", "sec"]).reset_index(drop=True) \
+        if any(isc(x) for x in labs) else pd.DataFrame(columns=["vin", "sec", "row", "src", "partner"])
+    AL = pd.concat([x for x in labs if not isc(x)]).sort_values("src", key=lambda s: s.map(rank)).drop_duplicates(["vin", "sec"]).reset_index(drop=True) \
+        if any(not isc(x) for x in labs) else pd.DataFrame(columns=["vin", "sec", "row", "src", "partner"])
+    out("")
+    out("[5] NPY: 全部脱离标签=%d条(%d文件, 有配对31帧样本的文件=%d)  关键脱离标签=%d条(%d文件, 有配对=%d)" % (
+        len(AL), AL.src.nunique() if len(AL) else 0, AL[AL.partner != ""].src.nunique() if len(AL) else 0,
+        len(CR), CR.src.nunique() if len(CR) else 0, CR[CR.partner != ""].src.nunique() if len(CR) else 0))
     G = pd.DataFrame(gant)
     if len(G):
         G["path"] = [os.path.join(a, b) for a, b in zip(G.dir, G.name)]
+        G["rank"] = G.path.map(rank)
+        G = G.sort_values("rank")
         G["s0"] = to_sec(pd.to_datetime(G.s, format="%Y%m%d%H%M%S", errors="coerce"))
         G["s1"] = to_sec(pd.to_datetime(G.e, format="%Y%m%d%H%M%S", errors="coerce"))
         G["inter"] = G.cam.str.extract(r"^(.+?路-.+?路)", expand=False)
-        cs = G[G.case_vin != ""].drop_duplicates(["case_vin", "case_t"])
-        cs = pd.DataFrame({"vin": cs.case_vin.values, "sec": to_sec(pd.to_datetime(cs.case_t, format="%Y-%m-%d %H%M%S", errors="coerce")).values})
-        gi = nearest(cs, U, 180)
-        U = pd.concat([U, pd.DataFrame({"vin": cs.vin[gi < 0], "sec": cs.sec[gi < 0], "来源": "龙门架案例", "veid": -1, "e9_row": -1})], ignore_index=True)
-    U = U.dropna(subset=["sec"]).reset_index(drop=True)
-    U["事件时间"] = pd.to_datetime(U.sec, unit="s")
-    U["event_key"] = U.vin + "_" + U["事件时间"].dt.strftime("%Y%m%d_%H%M%S")
-    U["日期"] = U["事件时间"].dt.date
-    out("")
-    out("[5] 事件全集=%d  来源: %s" % (len(U), "  ".join("%s:%d" % (a, b) for a, b in U["来源"].value_counts().items())))
-    out("    NPY: 全部脱离标签=%d条(%d个文件)  关键脱离标签=%d条(%d个文件)" % (len(AL), len(lab_all), len(CR), len(lab_crit)))
-    check("event_key 唯一", U.event_key.is_unique, "重复=%d" % U.event_key.duplicated().sum())
-
-    # ================= 6. 轨迹(逐事件) =================
-    cat = pd.read_csv(BASE + r"\04_tables\table_catalog.csv", dtype=str, keep_default_na=False)
-    cat = cat[cat.traj == "True"].drop_duplicates("path")
-    cat = cat[~cat.path.str.lower().str.contains("takeover_audit")]
-    cat = cat.assign(fname=cat.path.str.replace("/", "\\").str.split("\\").str[-1]).drop_duplicates(["fname", "size_mb"])
-    cat = cat[[os.path.exists(p) for p in cat.path]]
-    win = {}
-    for v, g in U.groupby("vin"):
-        a = np.sort(g.sec.values.astype(np.int64))
-        win[v] = (a - PAD, a + PAD)
-    VC = {"vin": ["vin", "vin_x", "t2.vin"], "t": ["position_time", "positiontime", "dis_engage_time", "time", "timestamp",
-          "position_time_sql", "gps_time"], "dm": ["drive_mode", "drivemode", "drive_mode_switch"],
-          "lat": ["latitude", "lat"], "lon": ["longitude", "lon", "lng"]}
-    pick = lambda cols, keys: next((c for k in keys for c in cols if str(c).strip().lower() == k), None)
-    hits, t0 = [], time.time()
-    for k, p in enumerate(cat.path, 1):
-        try:
-            if p.lower().endswith(".csv"):
-                hdr = enc = None
-                for enc in ("utf-8-sig", "gbk"):
-                    try:
-                        hdr = pd.read_csv(p, nrows=0, encoding=enc).columns; break
-                    except UnicodeDecodeError:
-                        continue
-                cv, ct, cd, ca, co = (pick(hdr, VC[x]) for x in ("vin", "t", "dm", "lat", "lon"))
-                if not (cv and ct and ca and co):
-                    continue
-                it = pd.read_csv(p, usecols=[c for c in (cv, ct, cd, ca, co) if c], dtype=str, chunksize=1_000_000, encoding=enc, on_bad_lines="skip")
-            else:
-                df = pd.read_excel(p, dtype=str)
-                cv, ct, cd, ca, co = (pick(df.columns, VC[x]) for x in ("vin", "t", "dm", "lat", "lon"))
-                if not (cv and ct and ca and co):
-                    continue
-                it = [df]
-            for ch in it:
-                vin = ch[cv].astype(str).str.upper().str.strip()
-                m = vin.isin(win)
-                if not m.any():
-                    continue
-                ch = ch[m]
-                b = pd.DataFrame({"vin": vin[m], "sec": to_sec(ch[ct]), "dm": ch[cd].astype(str) if cd else "",
-                                  "lat": pd.to_numeric(ch[ca], errors="coerce"), "lon": pd.to_numeric(ch[co], errors="coerce")}).dropna(subset=["sec"])
-                b = b[b.lat.notna() & b.lon.notna() & (b.lat != 0)]
-                for sh in SHIFTS:
-                    tt = b.sec.values.astype(np.int64) + sh
-                    keep = np.zeros(len(b), bool)
-                    for v, idx in b.groupby("vin").indices.items():
-                        st, en = win[v]
-                        i = np.searchsorted(st, tt[idx], side="right") - 1
-                        ok = i >= 0
-                        ok[ok] = tt[idx][ok] <= en[i[ok]]
-                        keep[idx] = ok
-                    if keep.any():
-                        h = b[keep].copy(); h["sec"] = tt[keep]; h["shift"] = sh; h["file"] = p; h["dm_col"] = (cd or "").lower()
-                        hits.append(h)
-        except Exception:
-            pass
-        if k % 100 == 0:
-            print("  ... 轨迹文件 %d/%d  %.0fs" % (k, len(cat), time.time() - t0))
-    H = pd.concat(hits) if hits else pd.DataFrame(columns=["vin", "sec", "dm", "lat", "lon", "shift", "file", "dm_col"])
-    if len(H):
-        best = H.drop_duplicates(["file", "shift", "vin", "sec"]).groupby(["file", "shift"]).size().reset_index(name="n")
-        H = H.merge(best.sort_values("n").drop_duplicates("file", keep="last")[["file", "shift"]], on=["file", "shift"])
-    Hg = {k: g for k, g in H.groupby("vin")} if len(H) else {}
-    rows = []
-    for r in U.itertuples():
-        rec = dict(轨迹_秒=0, 轨迹_文件="", 轨迹_源数=0, 轨迹_全部源="", 轨迹_偏移="", 轨迹_采样s=np.nan, 跳变_偏差s=np.nan, lat=np.nan, lon=np.nan)
-        g = Hg.get(r.vin)
-        if g is not None:
-            x = g[(g.sec - r.sec).abs() <= HALF]
-            if len(x):
-                per = x.groupby("file").sec.nunique().sort_values(ascending=False)
-                bf = per.index[0]
-                xb = x[x.file == bf].drop_duplicates("sec").sort_values("sec")
-                nb = xb.iloc[(xb.sec - r.sec).abs().argsort()[:3]]
-                rec.update(轨迹_秒=int(per.iloc[0]), 轨迹_文件=bf, 轨迹_源数=len(per),
-                           轨迹_全部源="; ".join("%s(%d)" % (f.replace("/", "\\").split("\\")[-1], n) for f, n in per.head(4).items()),
-                           轨迹_偏移="%+dh" % (int(xb["shift"].iloc[0]) // 3600), lat=nb.lat.median(), lon=nb.lon.median(),
-                           轨迹_采样s=float(np.median(np.diff(xb.sec.values))) if len(xb) > 1 else np.nan)
-                if xb.dm_col.iloc[0] in ("drive_mode", "drivemode"):
-                    d = pd.to_numeric(xb.dm, errors="coerce").values
-                    s = xb.sec.values
-                    idx = np.where((d[:-1] == 1) & (d[1:] == 0))[0]
-                    if len(idx):
-                        rec["跳变_偏差s"] = float(s[idx + 1][np.argmin(np.abs(s[idx + 1] - r.sec))] - r.sec)
-        rows.append(rec)
-    U = pd.concat([U, pd.DataFrame(rows)], axis=1)
-    U["有轨迹"] = U.轨迹_秒 >= T_MIN
-    out("")
-    out("[6] 轨迹文件=%d 用时%.0fs  事件±30s覆盖秒: 0:%d 1-19:%d 20-49:%d >=50:%d" % (len(cat), time.time() - t0,
-        (U.轨迹_秒 == 0).sum(), U.轨迹_秒.between(1, 19).sum(), U.轨迹_秒.between(20, 49).sum(), (U.轨迹_秒 >= 50).sum()))
-    tv = U[U.有轨迹]
-    out("    有轨迹=%d  采样: %s  偏移: %s  多源(>1个文件)=%d" % (len(tv),
-        " ".join("%gs:%d" % (a, b) for a, b in tv.轨迹_采样s.round().value_counts().head(4).items()),
-        " ".join("%s:%d" % (a, b) for a, b in tv.轨迹_偏移.value_counts().items()), (tv.轨迹_源数 > 1).sum()))
-    out("    drive_mode 1->0 跳变在事件附近: 找到=%d |偏差|<=5s:%d <=30s:%d" % (
-        tv.跳变_偏差s.notna().sum(), (tv.跳变_偏差s.abs() <= 5).sum(), (tv.跳变_偏差s.abs() <= 30).sum()))
-    out("    最佳轨迹来源(事件数):")
-    for f, n in tv.轨迹_文件.value_counts().head(8).items():
-        out("       %5d  %s" % (n, f[-78:]))
-
-    # ================= 7. NPY 归属 =================
-    U["NPY全部脱离"] = (nearest(U[["vin", "sec"]], AL, MERGE_S) >= 0) if len(AL) else False
-    U["NPY关键脱离"] = (nearest(U[["vin", "sec"]], CR, MERGE_S) >= 0) if len(CR) else False
-
-    # ================= 8. 路侧(逐类型) =================
+        G["case_sec"] = to_sec(pd.to_datetime(G.case_t, format="%Y-%m-%d %H%M%S", errors="coerce"))
     P = pd.DataFrame(rsj)
-    out("")
-    out("[8] 路侧盘点:")
     if len(P):
         P["path"] = [os.path.join(a, b) for a, b in zip(P.dir, P.name)]
         P["s0"] = to_sec(pd.to_datetime(P.s, format="%Y%m%d%H%M%S", errors="coerce"))
@@ -451,20 +367,224 @@ def main():
                     pass
             loc[d] = (la, lo)
         P["dlat"] = P.dir.map(lambda d: loc[d][0]); P["dlon"] = P.dir.map(lambda d: loc[d][1])
-        for t, g in P.groupby("typ"):
-            out("    %-12s 文件=%5d %6.1fGB  %s ~ %s  目录=%d" % (RS_TYPES.get(t, t), len(g), g["size"].sum() / 2**30,
-                sec2str(g.s0.min())[:16], sec2str(g.s1.max())[:16], g.dir.nunique()))
+        P = P.sort_values("path", key=lambda s: s.map(rank))
+    PJ = P[P.typ == "participant"].drop_duplicates(["s0", "s1", "dlat", "size"]) if len(P) else pd.DataFrame()
+
+    # ================= 6. 事件全集(第一部分) =================
+    U = pd.DataFrame({"vin": V.vin, "sec": V.sec, "来源": "视频", "veid": V.veid, "e9_row": -1})
+    m9 = e9[e9.vidx >= 0]
+    U.loc[m9.vidx.values, "sec"] = m9.sec.values
+    U.loc[m9.vidx.values, "来源"] = "视频+0920"
+    U.loc[m9.vidx.values, "e9_row"] = m9.e9_row.values
+    add = e9[e9.vidx < 0]
+    U = pd.concat([U, pd.DataFrame({"vin": add.vin, "sec": add.sec, "来源": "0920", "veid": -1, "e9_row": add.e9_row})], ignore_index=True)
+    ci = nearest(CR, U, MERGE_S)
+    U = pd.concat([U, pd.DataFrame({"vin": CR.vin[ci < 0], "sec": CR.sec[ci < 0], "来源": "NPY关键脱离", "veid": -1, "e9_row": -1})], ignore_index=True)
     if len(G):
-        out("    %-12s 文件=%5d %6.1fGB  %s ~ %s  路口=%d 带案例VIN=%d" % ("龙门架视频", len(G), G["size"].sum() / 2**30,
-            sec2str(G.s0.min())[:16], sec2str(G.s1.max())[:16], G.inter.nunique(), (G.case_vin != "").sum()))
-    M = pd.DataFrame(maps)
-    if len(M):
-        out("    %-12s 文件=%5d %6.1fGB  %s" % ("地图类(静态)", len(M), M["size"].sum() / 2**30,
-            " ".join("%s:%d" % (a, b) for a, b in M.ext.value_counts().head(6).items())))
-        M.to_csv(OUT_DIR + r"\map_files.csv", index=False, encoding="utf-8-sig")
-    dist = lambda la1, lo1, la2, lo2: np.hypot((la1 - la2) * 111320, (lo1 - lo2) * 111320 * np.cos(np.radians(31.3)))
+        cs = G[G.case_vin != ""].drop_duplicates(["case_vin", "case_t"])
+        cs = pd.DataFrame({"vin": cs.case_vin.values, "sec": cs.case_sec.values})
+        gi = nearest(cs, U, 180)
+        U = pd.concat([U, pd.DataFrame({"vin": cs.vin[gi < 0], "sec": cs.sec[gi < 0], "来源": "龙门架案例", "veid": -1, "e9_row": -1})], ignore_index=True)
+    U = U.dropna(subset=["sec"]).reset_index(drop=True)
+
+    # ================= 7. 读全部轨迹：事件窗口 + 路侧时段 + 每车每天是否有数据 =================
+    cat = pd.read_csv(BASE + r"\04_tables\table_catalog.csv", dtype=str, keep_default_na=False)
+    cat = cat[cat.traj == "True"].drop_duplicates("path")
+    cat = cat[[os.path.exists(p) for p in cat.path]].copy()
+    cat["rank"] = cat.path.map(rank)
+    cat["mtime"] = [os.path.getmtime(p) for p in cat.path]
+    cat["fname"] = cat.path.str.replace("/", "\\").str.split("\\").str[-1]
+    cat = cat.sort_values(["rank", "mtime"]).drop_duplicates(["fname", "size_mb"])      # 同名同大小只读原始那份
+    win = {}
+    for v, g in U.groupby("vin"):
+        a = np.sort(g.sec.values.astype(np.int64))
+        win[v] = (a - PAD, a + PAD)
+    # 路侧时段（participant 每个文件的时间窗 + 设备位置）
+    if len(PJ):
+        pjw = PJ.dropna(subset=["s0", "s1"]).sort_values("s0")
+        pj_st, pj_en = pjw.s0.values.astype(np.int64), pjw.s1.values.astype(np.int64)
+        dev = pjw[["dlat", "dlon"]].dropna().drop_duplicates()
+    else:
+        pj_st = pj_en = np.array([], dtype=np.int64); dev = pd.DataFrame(columns=["dlat", "dlon"])
+    VC = {"vin": ["vin", "vin_x", "t2.vin"], "t": ["position_time", "positiontime", "dis_engage_time", "time", "timestamp",
+          "position_time_sql", "gps_time"], "dm": ["drive_mode", "drivemode", "drive_mode_switch"],
+          "lat": ["latitude", "lat"], "lon": ["longitude", "lon", "lng"]}
+    pick = lambda cols, keys: next((c for k in keys for c in cols if str(c).strip().lower() == k), None)
+    hits, rhits, days, fstat, t0 = [], [], set(), [], time.time()
+    uvins = set(win)
+    for k, p in enumerate(cat.path, 1):
+        try:
+            if p.lower().endswith(".csv"):
+                hdr = enc = None
+                for enc in ("utf-8-sig", "gbk"):
+                    try:
+                        hdr = pd.read_csv(p, nrows=0, encoding=enc).columns; break
+                    except UnicodeDecodeError:
+                        continue
+                cv, ct, cd, ca, co = (pick(hdr, VC[x]) for x in ("vin", "t", "dm", "lat", "lon"))
+                if not (cv and ct and ca and co):
+                    continue
+                it = pd.read_csv(p, usecols=[c for c in (cv, ct, cd, ca, co) if c], dtype=str, chunksize=1_000_000, encoding=enc, on_bad_lines="skip")
+            else:
+                df = pd.read_excel(p, dtype=str)
+                cv, ct, cd, ca, co = (pick(df.columns, VC[x]) for x in ("vin", "t", "dm", "lat", "lon"))
+                if not (cv and ct and ca and co):
+                    continue
+                it = [df]
+            tmin = tmax = None; nv = set()
+            for ch in it:
+                vin = ch[cv].astype(str).str.upper().str.strip()
+                b = pd.DataFrame({"vin": vin, "sec": to_sec(ch[ct]), "dm": ch[cd].astype(str) if cd else "",
+                                  "lat": pd.to_numeric(ch[ca], errors="coerce"), "lon": pd.to_numeric(ch[co], errors="coerce")}).dropna(subset=["sec"])
+                b = b[b.lat.notna() & b.lon.notna() & (b.lat != 0)]
+                if not len(b):
+                    continue
+                tmin = b.sec.min() if tmin is None else min(tmin, b.sec.min())
+                tmax = b.sec.max() if tmax is None else max(tmax, b.sec.max())
+                nv.update(b.vin.unique().tolist())
+                bu = b[b.vin.isin(uvins)]
+                for sh in SHIFTS:
+                    # (a) 事件窗口
+                    if len(bu):
+                        tt = bu.sec.values.astype(np.int64) + sh
+                        keep = np.zeros(len(bu), bool)
+                        for v, idx in bu.groupby("vin").indices.items():
+                            st, en = win[v]
+                            i = np.searchsorted(st, tt[idx], side="right") - 1
+                            ok = i >= 0
+                            ok[ok] = tt[idx][ok] <= en[i[ok]]
+                            keep[idx] = ok
+                        if keep.any():
+                            h = bu[keep].copy(); h["sec"] = tt[keep]; h["shift"] = sh; h["file"] = p; h["dm_col"] = (cd or "").lower()
+                            hits.append(h)
+                        # (c) 每车每天是否有数据(按偏移后日期)
+                        dd = pd.DataFrame({"vin": bu.vin.values, "day": (tt // 86400)}).drop_duplicates()
+                        days.update(zip(dd.vin, dd.day, [sh] * len(dd)))
+                    # (b) 路侧时段 + 离设备近（所有 VIN）
+                    if len(pj_st) and len(dev):
+                        tt2 = b.sec.values.astype(np.int64) + sh
+                        i = np.searchsorted(pj_st, tt2, side="right") - 1
+                        ok = i >= 0
+                        ok[ok] = tt2[ok] <= pj_en[i[ok]]
+                        if ok.any():
+                            bb = b[ok].copy(); bb["sec"] = tt2[ok]
+                            dmin = np.min(np.vstack([dist(bb.lat, bb.lon, la, lo) for la, lo in zip(dev.dlat, dev.dlon)]), axis=0)
+                            bb = bb[dmin <= RS_NEAR]
+                            if len(bb):
+                                bb["shift"] = sh; bb["file"] = p; bb["dm_col"] = (cd or "").lower()
+                                rhits.append(bb)
+            fstat.append(dict(file=p, rank=rank(p), tmin=sec2str(tmin), tmax=sec2str(tmax), vins=len(nv)))
+        except Exception:
+            pass
+        if k % 100 == 0:
+            print("  ... 轨迹文件 %d/%d  %.0fs" % (k, len(cat), time.time() - t0))
+    FS = pd.DataFrame(fstat); FS.to_csv(OUT_DIR + r"\traj_files.csv", index=False, encoding="utf-8-sig")
+    H = pd.concat(hits) if hits else pd.DataFrame(columns=["vin", "sec", "dm", "lat", "lon", "shift", "file", "dm_col"])
+    # 每个文件只保留命中事件窗口最多的那个时区偏移；路侧命中沿用同一偏移
+    fshift = {}
+    if len(H):
+        best = H.drop_duplicates(["file", "shift", "vin", "sec"]).groupby(["file", "shift"]).size().reset_index(name="n")
+        best = best.sort_values("n").drop_duplicates("file", keep="last")
+        fshift = dict(zip(best.file, best["shift"]))
+        H = H.merge(best[["file", "shift"]], on=["file", "shift"])
+    RH = pd.concat(rhits) if rhits else pd.DataFrame(columns=H.columns)
+    if len(RH):
+        RH["want"] = RH.file.map(fshift)
+        # 没有事件可定偏移的文件：取在路侧时段内点数最多的偏移
+        nos = RH[RH.want.isna()].groupby(["file", "shift"]).size().reset_index(name="n").sort_values("n").drop_duplicates("file", keep="last")
+        RH.loc[RH.want.isna(), "want"] = RH.loc[RH.want.isna(), "file"].map(dict(zip(nos.file, nos["shift"])))
+        RH = RH[RH["shift"] == RH.want].drop(columns="want")
+    out("")
+    out("[7] 轨迹文件(去重后,原始优先)=%d 用时%.0fs  事件窗口命中点=%d  路侧时段命中点=%d" % (len(cat), time.time() - t0, len(H), len(RH)))
+
+    # ================= 8. 路侧时段内的自车与接管(并入事件全集) =================
+    rs_events = pd.DataFrame(columns=["vin", "sec", "lat", "lon", "file"])
+    if len(RH):
+        R1 = RH.drop_duplicates(["vin", "sec"]).sort_values(["vin", "sec"]).reset_index(drop=True)
+        R1["day"] = pd.to_datetime(R1.sec, unit="s").dt.date
+        dmc = R1.dm_col.isin(["drive_mode", "drivemode"])
+        d = pd.to_numeric(R1.dm, errors="coerce")
+        sw = R1[dmc & R1.vin.eq(R1.vin.shift(1)) & (d.shift(1) == 1) & (d == 0) & ((R1.sec - R1.sec.shift(1)) <= 10)]
+        sw = sw[~(sw.groupby("vin").sec.diff() < MERGE_S).fillna(False).values]
+        rs_events = sw[["vin", "sec", "lat", "lon", "file"]].reset_index(drop=True)
+        ri = nearest(rs_events, U, MERGE_S)
+        new = rs_events[ri < 0]
+        U = pd.concat([U, pd.DataFrame({"vin": new.vin, "sec": new.sec, "来源": "路侧时段轨迹接管", "veid": -1, "e9_row": -1})], ignore_index=True)
+        R1.to_csv(OUT_DIR + r"\roadside_ego_points.csv", index=False, encoding="utf-8-sig")
+    if len(RH):
+        H = pd.concat([H, RH[H.columns]]).drop_duplicates(["vin", "sec", "file"])   # 路侧时段内的自车点也用于逐事件轨迹
+    U["事件时间"] = pd.to_datetime(U.sec, unit="s")
+    U["event_key"] = U.vin + "_" + U["事件时间"].dt.strftime("%Y%m%d_%H%M%S")
+    U["日期"] = U["事件时间"].dt.date
+    out("")
+    out("[8] 事件全集=%d  来源: %s" % (len(U), "  ".join("%s:%d" % (a, b) for a, b in U["来源"].value_counts().items())))
+    check("event_key 唯一", U.event_key.is_unique, "重复=%d" % U.event_key.duplicated().sum())
+
+    # ================= 9. 逐事件：表格轨迹 / NPY轨迹 / 当天是否有数据 =================
+    Hg = {k: g for k, g in H.groupby("vin")} if len(H) else {}
+    ai = nearest(U[["vin", "sec"]], AL, MERGE_S) if len(AL) else pd.Series(-1, index=U.index)
+    cj = nearest(U[["vin", "sec"]], CR, MERGE_S) if len(CR) else pd.Series(-1, index=U.index)
+    dayset = {}
+    for v, dday, sh in days:
+        dayset.setdefault(v, set()).add(dday)
+    rows = []
+    for idx, r in U.iterrows():
+        rec = dict(轨迹_秒=0, 轨迹_原始文件="", 轨迹_源数=0, 轨迹_全部源="", 轨迹_偏移="", 轨迹_采样s=np.nan, 跳变_偏差s=np.nan,
+                   lat=np.nan, lon=np.nan, NPY帧=0, NPY文件="", NPY行=-1)
+        g = Hg.get(r.vin)
+        if g is not None:
+            x = g[(g.sec - r.sec).abs() <= HALF]
+            if len(x):
+                per = x.groupby("file").sec.nunique().reset_index(name="n")
+                per["rank"] = per.file.map(rank)
+                per = per.sort_values(["n", "rank"], ascending=[False, True])
+                bf = per.file.iloc[0]
+                xb = x[x.file == bf].drop_duplicates("sec").sort_values("sec")
+                nb = xb.iloc[(xb.sec - r.sec).abs().argsort()[:3]]
+                rec.update(轨迹_秒=int(per.n.iloc[0]), 轨迹_原始文件=bf, 轨迹_源数=len(per),
+                           轨迹_全部源="; ".join("%s(%d)" % (f, n) for f, n in zip(per.file.head(5), per.n.head(5))),
+                           轨迹_偏移="%+dh" % (int(xb["shift"].iloc[0]) // 3600), lat=nb.lat.median(), lon=nb.lon.median(),
+                           轨迹_采样s=float(np.median(np.diff(xb.sec.values))) if len(xb) > 1 else np.nan)
+                if xb.dm_col.iloc[0] in ("drive_mode", "drivemode"):
+                    d = pd.to_numeric(xb.dm, errors="coerce").values
+                    s = xb.sec.values
+                    j = np.where((d[:-1] == 1) & (d[1:] == 0))[0]
+                    if len(j):
+                        rec["跳变_偏差s"] = float(s[j + 1][np.argmin(np.abs(s[j + 1] - r.sec))] - r.sec)
+        for lab, ii in ((CR, cj.at[idx]), (AL, ai.at[idx])):
+            if ii >= 0 and lab.at[ii, "partner"]:
+                nf, tot = npy_frames(lab.at[ii, "partner"], lab.at[ii, "row"])
+                if nf > rec["NPY帧"]:
+                    rec.update(NPY帧=nf, NPY文件=lab.at[ii, "partner"], NPY行=int(lab.at[ii, "row"]))
+        dd = int(r.sec // 86400)
+        rec["当天有表格轨迹"] = bool(dayset.get(r.vin, set()) & {dd - 1, dd, dd + 1})
+        rows.append(rec)
+    U = pd.concat([U, pd.DataFrame(rows, index=U.index)], axis=1)
+    U["NPY全部脱离"] = ai >= 0
+    U["NPY关键脱离"] = cj >= 0
+    U["有表格轨迹"] = U.轨迹_秒 >= T_MIN
+    U["有NPY轨迹"] = U.NPY帧 >= T_MIN
+    U["有轨迹"] = U.有表格轨迹 | U.有NPY轨迹
+    U["轨迹类型"] = np.select([U.有表格轨迹 & U.有NPY轨迹, U.有表格轨迹, U.有NPY轨迹, U.轨迹_秒 > 0],
+                           ["表格+NPY", "表格(逐秒)", "NPY(31帧)", "表格(不足20s)"], "无")
+    out("")
+    out("[9] 轨迹: 事件±30s覆盖秒 0:%d 1-19:%d 20-49:%d >=50:%d ; NPY帧>=20:%d" % (
+        (U.轨迹_秒 == 0).sum(), U.轨迹_秒.between(1, 19).sum(), U.轨迹_秒.between(20, 49).sum(), (U.轨迹_秒 >= 50).sum(), U.有NPY轨迹.sum()))
+    out("    轨迹类型: " + "  ".join("%s:%d" % (a, b) for a, b in U.轨迹类型.value_counts().items()))
+    tv = U[U.有表格轨迹]
+    out("    表格轨迹: 采样 %s ; 偏移 %s ; 跳变找到=%d (|偏差|<=5s:%d <=30s:%d)" % (
+        " ".join("%gs:%d" % (a, b) for a, b in tv.轨迹_采样s.round().value_counts().head(4).items()),
+        " ".join("%s:%d" % (a, b) for a, b in tv.轨迹_偏移.value_counts().items()),
+        tv.跳变_偏差s.notna().sum(), (tv.跳变_偏差s.abs() <= 5).sum(), (tv.跳变_偏差s.abs() <= 30).sum()))
+    out("    最佳表格轨迹来源(原始地址, 事件数):")
+    for f, n in tv.轨迹_原始文件.value_counts().head(8).items():
+        out("       %5d  %s" % (n, f[-90:]))
+    if U.有NPY轨迹.any():
+        out("    NPY轨迹来源: " + "  ".join("%s:%d" % (f[-60:], n) for f, n in U[U.有NPY轨迹].NPY文件.value_counts().head(3).items()))
+
+    # ================= 10. 路侧逐类型 =================
     cols = {t: [] for t in RS_TYPES}
-    gcase, gany = [], []
+    gcase, gany, gdt, ginter = [], [], [], []
     for r in U.itertuples():
         for t in RS_TYPES:
             c = P[(P.typ == t) & (P.s0 <= r.sec) & (P.s1 >= r.sec)] if len(P) else pd.DataFrame()
@@ -473,17 +593,22 @@ def main():
             cols[t].append(";".join(c.path.head(2)) if len(c) else "")
         if len(G):
             a = G[(G.s0 <= r.sec + HALF) & (G.s1 >= r.sec - HALF)]
-            gcase.append(";".join(a[a.case_vin == r.vin].path.head(4)))
+            a2 = a[a.case_vin == r.vin].drop_duplicates("name")
+            gcase.append(";".join(a2.path.head(6)))
+            ginter.append("/".join(sorted(set(a2.inter.dropna()))))
+            gdt.append(float((a2.case_sec - r.sec).abs().min()) if len(a2) else np.nan)
             gany.append(";".join(sorted(set(a.inter.dropna())))[:200])
         else:
-            gcase.append(""); gany.append("")
+            gcase.append(""); gany.append(""); gdt.append(np.nan); ginter.append("")
     for t, lab in RS_TYPES.items():
         U["路侧_" + lab] = cols[t]
     U["路侧_龙门架(同VIN)"] = gcase
+    U["路侧_龙门架案例时间差s"] = gdt
+    U["路侧_龙门架路口(同VIN)"] = ginter
     U["路侧_同时段龙门架路口"] = gany
     U["有路侧"] = (U["路侧_龙门架(同VIN)"] != "") | (U["路侧_周边交通参与者"] != "")
 
-    # ================= 9. 资产表 =================
+    # ================= 11. 资产表 =================
     U = U.merge(V.drop(columns=["sec", "vin"]), on="veid", how="left")
     for c in "123":
         U["ch%s_可读" % c] = U["ch%s_可读" % c].fillna(0).astype(int)
@@ -494,14 +619,16 @@ def main():
     U["在0920"] = U.e9_row > 0
     U["前人35"] = U["在0920"] & (U["通道(文件)"] == "123")
     has1 = U.ch1_可读 > 0
+    hasv = U["通道(文件)"] != ""
     U["类别"] = np.select(
         [has1 & U.有轨迹 & U["在0920"], has1 & U.有轨迹 & ~U["在0920"], has1 & ~U.有轨迹,
-         (U.ch2_可读 + U.ch3_可读 > 0) & ~has1, U.有轨迹 & U.有路侧, U.有轨迹, U["在0920"]],
-        ["A 视频ch1+轨迹+原因", "B 视频ch1+轨迹,无原因", "C 视频ch1,无轨迹", "D 仅ch2/ch3视频",
-         "E 无视频,轨迹+路侧", "F 无视频,仅自车轨迹", "G 仅0920记录"], "H 其他(仅NPY/案例)")
+         (U.ch2_可读 + U.ch3_可读 > 0) & ~has1, hasv & (U["通道(可读)"] == ""),
+         U.有轨迹 & U.有路侧, U.有轨迹, U["在0920"]],
+        ["A 视频ch1+轨迹+原因", "B 视频ch1+轨迹,无原因", "C 视频ch1,无轨迹", "D 仅ch2/ch3视频", "X 视频全部不可读",
+         "E 无视频,轨迹+路侧", "F 无视频,仅自车轨迹", "G 仅0920记录(无轨迹)"], "H 仅NPY/案例(无轨迹)")
     front = ["event_key", "vin", "日期", "事件时间", "来源", "类别", "通道(可读)", "ch1_可读", "ch2_可读", "ch3_可读",
-             "有轨迹", "轨迹_秒", "轨迹_采样s", "轨迹_偏移", "跳变_偏差s", "轨迹_源数", "轨迹_全部源", "在0920", "前人35",
-             "NPY全部脱离", "NPY关键脱离", "有路侧"]
+             "有轨迹", "轨迹类型", "轨迹_秒", "NPY帧", "轨迹_采样s", "轨迹_偏移", "跳变_偏差s", "当天有表格轨迹",
+             "轨迹_原始文件", "轨迹_全部源", "NPY文件", "NPY行", "在0920", "前人35", "NPY全部脱离", "NPY关键脱离", "有路侧"]
     U = U[front + [c for c in U.columns if c not in front]]
     U.to_csv(OUT_DIR + r"\事件资产表.csv", index=False, encoding="utf-8-sig")
     try:
@@ -509,47 +636,97 @@ def main():
     except Exception as e:
         out("xlsx 写出失败 %r" % e)
 
-    # ================= 10. 统计 =================
+    # ================= 12. 统计 =================
     out("")
     out("################ 资产覆盖(按事件来源) ################")
     items = [("ch1前视", U.ch1_可读 > 0), ("ch2座舱", U.ch2_可读 > 0), ("ch3踏板", U.ch3_可读 > 0),
-             ("三通道", U["通道(可读)"] == "123"), ("自车轨迹", U.有轨迹), ("0920原因", U["在0920"]),
-             ("NPY全部", U.NPY全部脱离), ("NPY关键", U.NPY关键脱离)] + \
+             ("三通道", U["通道(可读)"] == "123"), ("表格轨迹", U.有表格轨迹), ("NPY轨迹", U.有NPY轨迹), ("有轨迹(任一)", U.有轨迹),
+             ("0920原因", U["在0920"]), ("NPY全部", U.NPY全部脱离), ("NPY关键", U.NPY关键脱离)] + \
             [(lab, U["路侧_" + lab] != "") for lab in RS_TYPES.values()] + [("龙门架同VIN", U["路侧_龙门架(同VIN)"] != "")]
     srcs = list(U["来源"].value_counts().index)
-    out("  %-12s %6s | " % ("资产", "全部") + " ".join("%9s" % s[:9] for s in srcs))
+    out("  %-12s %6s | " % ("资产", "全部") + " ".join("%9s" % s[:8] for s in srcs))
     out("  %-12s %6d | " % ("事件数", len(U)) + " ".join("%9d" % (U["来源"] == s).sum() for s in srcs))
     for lab, m in items:
         out("  %-12s %6d | " % (lab, m.sum()) + " ".join("%9d" % (m & (U["来源"] == s)).sum() for s in srcs))
     out("")
-    out("################ 资产组合 Top15 (1=有) ################")
-    combo = pd.DataFrame({"ch1": (U.ch1_可读 > 0).astype(int), "ch2": (U.ch2_可读 > 0).astype(int), "ch3": (U.ch3_可读 > 0).astype(int),
-                          "轨迹": U.有轨迹.astype(int), "原因": U["在0920"].astype(int), "关键": U.NPY关键脱离.astype(int), "路侧": U.有路侧.astype(int)})
-    cc = combo.groupby(list(combo.columns)).size().reset_index(name="n").sort_values("n", ascending=False).head(15)
-    out("  " + " ".join("%4s" % c for c in combo.columns) + "   事件数")
-    for _, r in cc.iterrows():
-        out("  " + " ".join("%4d" % r[c] for c in combo.columns) + "   %5d" % r.n)
-    out("")
     out("################ 分类 ################")
     for c, g in U.groupby("类别"):
-        out("  %-22s %5d  (三通道=%d 有路侧=%d 日期 %s~%s)" % (c, len(g), (g["通道(可读)"] == "123").sum(), g.有路侧.sum(), g.日期.min(), g.日期.max()))
+        out("  %-24s %5d  三通道=%d 表格轨迹=%d NPY轨迹=%d 路侧=%d  %s~%s" % (c, len(g), (g["通道(可读)"] == "123").sum(),
+            g.有表格轨迹.sum(), g.有NPY轨迹.sum(), g.有路侧.sum(), g.日期.min(), g.日期.max()))
     check("分类合计=事件数", U["类别"].value_counts().sum() == len(U))
-    out("  前人35=%d ; 视频事件中: 在0920=%d 清单外有ch1+轨迹=%d 清单外仅ch1=%d" % (U["前人35"].sum(),
+    nt = U[~U.有轨迹 & (U.veid >= 0)]
+    out("  有视频但无轨迹的事件=%d: 当天该车有表格轨迹=%d(疑似时间未对齐,需人工核)  当天完全无数据=%d  有不足20s的片段=%d" % (
+        len(nt), nt.当天有表格轨迹.sum(), (~nt.当天有表格轨迹).sum(), (nt.轨迹_秒 > 0).sum()))
+    out("  前人35=%d ; 视频事件: 在0920=%d  清单外有ch1+轨迹=%d  清单外仅ch1无轨迹=%d" % (U["前人35"].sum(),
         (U["在0920"] & (U.veid >= 0)).sum(), (~U["在0920"] & has1 & U.有轨迹).sum(), (~U["在0920"] & has1 & ~U.有轨迹).sum()))
+    ab = U[U["类别"].str[0].isin(["A", "B"]) & U.有表格轨迹 & U.跳变_偏差s.notna()]
+    check("A/B 类表格轨迹的接管跳变与事件时间一致(<=30s)", (ab.跳变_偏差s.abs() <= 30).all(),
+          "有跳变信息=%d 超出=%d" % (len(ab), (ab.跳变_偏差s.abs() > 30).sum()))
+
+    # ================= 13. E 类逐条确认 =================
+    Ecl = U[U["类别"].str.startswith("E")].sort_values("事件时间")
     out("")
-    out("################ 数据地址与匹配方法 ################")
-    top = lambda s: s.fillna("").str.split(";").str[0].str.extract(r"^([A-Za-z]:\\[^\\]+)", expand=False)
+    out("################ E 类(无视频,轨迹+路侧) 逐条确认: %d 条 ################" % len(Ecl))
+    out("  VIN后6 | 事件时间 | 来源 | 轨迹(秒/偏移/跳变) | 龙门架路口(案例时间差s) | 周边参与者 | 原因")
+    for _, r in Ecl.head(40).iterrows():
+        out("  %s | %s | %s | %ds/%s/%s | %s(%s) | %s | %s" % (r.vin[-6:], str(r.事件时间)[:19], r["来源"], r.轨迹_秒, r.轨迹_偏移,
+            "" if pd.isna(r.跳变_偏差s) else "%+.0fs" % r.跳变_偏差s, str(r["路侧_龙门架路口(同VIN)"])[:30], "" if pd.isna(r["路侧_龙门架案例时间差s"]) else "%.0f" % r["路侧_龙门架案例时间差s"],
+            "有" if r["路侧_周边交通参与者"] else "-", str(r.get("描述", ""))[:16]))
+    eg = Ecl[Ecl["路侧_龙门架(同VIN)"] != ""]
+    check("E类龙门架: 案例目录VIN一致且案例时间与事件相差<=180s", (eg["路侧_龙门架案例时间差s"] <= 180).all(),
+          "龙门架=%d 超出=%d" % (len(eg), (eg["路侧_龙门架案例时间差s"] > 180).sum()))
+    check("E类都有表格或NPY轨迹", Ecl.有轨迹.all())
+
+    # ================= 14. 路侧覆盖 / 2025 专项 =================
+    out("")
+    out("################ 路侧覆盖时段专项(participant; 含2025) ################")
+    if len(PJ):
+        seg = PJ.dropna(subset=["s0"]).copy()
+        seg["年"] = pd.to_datetime(seg.s0, unit="s").dt.year
+        for (y, d), g in seg.groupby(["年", "dir"]):
+            out("  %d %-55s 文件=%4d 时长=%5.1fh  %s~%s  设备(%.4f,%.4f)" % (y, d[-55:], len(g), (g.s1 - g.s0).sum() / 3600,
+                sec2str(g.s0.min())[:16], sec2str(g.s1.max())[:16], g.dlat.iloc[0], g.dlon.iloc[0]))
+    if len(RH):
+        R1["年"] = pd.to_datetime(R1.sec, unit="s").dt.year
+        out("  覆盖时段内、离设备<=%dm 的自车轨迹:" % RS_NEAR)
+        for y, g in R1.groupby("年"):
+            out("    %d年: 车辆=%d 点(秒)=%d 天=%d  来源文件: %s" % (y, g.vin.nunique(), len(g), g.day.nunique(),
+                "  ".join("%s:%d" % (f.replace("/", "\\").split("\\")[-1][:28], n) for f, n in g.file.value_counts().head(3).items())))
+        rse = rs_events.assign(年=pd.to_datetime(rs_events.sec, unit="s").dt.year) if len(rs_events) else rs_events
+        out("  覆盖时段内的接管(drive_mode 1->0): %s" % ("  ".join("%d年:%d(车%d)" % (y, len(g), g.vin.nunique()) for y, g in rse.groupby("年")) or "0"))
+    else:
+        out("  覆盖时段内没有找到任何自车轨迹点")
+    rsdir = FS[FS.file.str.contains("运行安全评价")]
+    if len(rsdir):
+        out("  运行安全评价 TTC 案例轨迹文件=%d  时间 %s ~ %s  (逐文件见 traj_files.csv)" % (len(rsdir),
+            rsdir.tmin[rsdir.tmin != ""].min()[:10], rsdir.tmax[rsdir.tmax != ""].max()[:10]) + " (文件原始时间,未做时区换算)")
+    y25 = U[U["事件时间"].dt.year == 2025]
+    out("  资产表中2025年事件=%d  类别: %s" % (len(y25), "  ".join("%s:%d" % (a, b) for a, b in y25["类别"].value_counts().items()) or "-"))
+
+    # ================= 15. 数据地址(原始)与匹配方法 =================
+    out("")
+    out("################ 数据地址(原始位置)与匹配方法 ################")
+    def top(s):
+        f = s.fillna("").str.split(";").str[0]
+        d = f.str.extract(r"^([A-Za-z]:\\[^\\]+)", expand=False)
+        return d.fillna(f.map(lambda x: os.path.dirname(os.path.dirname(x)) if x else np.nan))
     for c, g in U.groupby("类别"):
-        vp = g.ch1_路径.fillna("").where(g.ch1_路径.fillna("") != "", g.ch3_路径.fillna(""))
+        vp = g.ch1_原始路径.fillna("").where(g.ch1_原始路径.fillna("") != "", g.ch3_原始路径.fillna(""))
         vd = top(vp).value_counts().head(4)
-        tf = g[g.有轨迹].轨迹_文件.str.replace("/", "\\").str.split("\\").str[-1].value_counts().head(3)
-        out("  %s: 视频 %s | 轨迹 %s" % (c[:12], " ".join("%s:%d" % (a, b) for a, b in vd.items()) or "-",
-                                       " ".join("%s:%d" % (a[:22], b) for a, b in tf.items()) or "-"))
-    out("  索引: event_key = VIN_YYYYMMDD_HHMMSS(北京时间)。同VIN且相差<=60s 归为同一事件")
-    out("  视频: 路径中的VIN + 文件名 ch{1|2|3}_{起}_{止} ; 0920: VIN + disengage_time ; 轨迹: VIN + 事件±30s(自动 0/+8h/-8h)")
-    out("  NPY: labels 的 VIN+时间 ±60s ; 路侧json: 时段覆盖事件 且 距事件<=%dm ; 龙门架: 时段重叠 且 案例目录VIN一致" % RS_RADIUS)
+        tf = g[g.有表格轨迹].轨迹_原始文件.value_counts().head(2)
+        out("  %s" % c)
+        out("     视频: %s" % (" ".join("%s:%d" % (a, b) for a, b in vd.items()) or "-"))
+        out("     轨迹: %s%s" % (" ; ".join("%s(%d)" % (a[-70:], b) for a, b in tf.items()) or "-",
+                              ("  + NPY:%d" % g.有NPY轨迹.sum()) if g.有NPY轨迹.any() else ""))
+    out("  索引: event_key = VIN_YYYYMMDD_HHMMSS(北京时间), 同VIN相差<=60s 归为同一事件")
+    out("  视频: 路径中的VIN + 文件名 ch{1|2|3}_{起}_{止}; 多副本取原始目录那份, 其余副本列在 ch*_全部副本")
+    out("  0920: VIN + disengage_time; 轨迹: VIN + 事件±30s(每个文件自动选 0/+8h/-8h), 同名同大小的拷贝只读原始那份")
+    out("  NPY: labels 的 VIN+时间 ±60s, 行号对应同目录3维样本(31帧); 路侧json: 时段覆盖事件且距事件<=%dm; 龙门架: 时段重叠且案例目录VIN一致" % RS_RADIUS)
     out("")
     out("检查项 PASS=%d FAIL=%d  资产表: %s\\事件资产表.xlsx" % (sum(c[1] for c in CHECKS), sum(not c[1] for c in CHECKS), OUT_DIR))
+    for n_, ok, d_ in CHECKS:
+        if not ok:
+            out("  FAIL: %s  %s" % (n_, d_))
     out("=== END %s %s  用时%.0fs ===" % (NAME, VERSION, time.time() - t00))
     open(OUT_DIR + r"\summary.txt", "w", encoding="utf-8").write("\n".join(L))
 
