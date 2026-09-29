@@ -144,7 +144,7 @@
 | 数据 | 数量 | 时间 | 主要字段 |
 |---|---|---|---|
 | 自车视频 | 1424 个文件，29.0 GB，1117 段 | 2023-12-01 ~ 2024-07-23 | ch1 前视 / ch2 座舱 / ch3 踏板 |
-| 0920 台账 | 1925 条 | 2024 年 | disengage_time, vin, acc_long, acc_lat, acc_long_min, acc_lat_abs_max, distance, cross_name1, 是否紧急接管, 道路类型, 交通灯, 天气, 光线, 主车行为, 目标物, 目标物行为, 与目标物相对关系, 描述 |
+| 0920 台账 | 1925 条 | 2024-04 ~ 2024-09 | disengage_time, vin, acc_long, acc_lat, acc_long_min, acc_lat_abs_max, distance, cross_name1, 是否紧急接管, 道路类型, 交通灯, 天气, 光线, 主车行为, 目标物, 目标物行为, 与目标物相对关系, 描述 |
 | 表格轨迹 | 2710 个文件（去重后） | 2023-12 ~ 2025-05 | vin, position_time / positiontime, drive_mode, latitude, longitude（部分文件还有速度、加速度） |
 | local_vehicle_info | 50 个文件，4.66 GB | 连续的车端原始导出 | vin, positiontime, drivemode, 经纬度 |
 | NPY 全部脱离 labels | 1,722,711 条（13 个文件，其中 5 个有 31 帧样本） | 2021-07 ~ 2024-01-02 | vin, 时间, 经纬度；样本数组（N, 31, 5） |
