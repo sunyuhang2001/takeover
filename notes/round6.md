@@ -28,6 +28,6 @@
 - 共读了 4986 张表，其中 960 张含有 0920 的事件。按脚本口径分：上游 47 张，同源 25 张，只含部分事件的 888 张。
 - 被判成"上游"的，大多是**每个事件前后的轨迹窗口表**，比如 all927、dis_joined、all_1021。它们行数多，是因为每个事件带了一段轨迹，并不是事件更多，所以不算真正的上游。
 - **真正需要跟进的有两张**：
-  - **dis_joined3_30s / dis_joined3_60s**：按 disengage_time 去重后分别有 2396 和 2771 个事件，涉及 102 个 VIN，带 critical_engage、video_avaliable、road_type 等标签。**比 0920 多出几百个带标签的事件。**
+  - ~~dis_joined3_30s / dis_joined3_60s 比 0920 多出几百个带标签的事件~~ **（已更正）**：用户核对后确认这两张表里 dis_id 只有 1925 个。之前说的 2396 和 2771，是按"vin + disengage_time"去重数出来的；同一个 dis_id 下有多个 disengage_time 取值，所以数多了。**这两张表和 0920 是同一批事件。** 11 v2 会检查这些多出来的 disengage_time 具体是怎么产生的。
   - **projects\project\ignore\vehicle_switch_20241127155033.csv**：switch 平台的逐点导出，181 万个点，269 个 VIN，时间存为 UTC。0920 的事件在里面 100% 都能找到。
 - **代码层面**：没有找到生成 0920 的代码。唯一的写出操作是 biaogeziduantiaozheng.ipynb 用 to_excel 写出了 t1.xlsx。

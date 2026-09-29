@@ -8,7 +8,7 @@ import os, sys, re, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "11_event_lists", "v1"
+NAME, VERSION = "11_event_lists", "v2"
 BASE = r"D:\takeover_audit"
 OUT_DIR = BASE + r"\11_lists"
 TOL = 2          # 与 0920 的时间容差(s)
@@ -94,6 +94,15 @@ def main():
         try:
             d = pd.read_csv(p, low_memory=False) if p.lower().endswith(".csv") else pd.read_excel(p)
             vc = next(c for c in d.columns if str(c).lower() in ("vin", "vin_x"))
+            if "dis_id" in d.columns:
+                g = d.groupby("dis_id")
+                nt = g["disengage_time"].nunique()
+                span = g["disengage_time"].apply(lambda s: (to_sec(s).max() - to_sec(s).min()))
+                out("  %s  dis_id=%d  其中含多个disengage_time的=%d  (同一dis_id内最大时间差: <=1s:%d  <=60s:%d  >60s:%d)" % (
+                    p[-50:], len(nt), (nt > 1).sum(), (span[nt > 1] <= 1).sum(), ((span > 1) & (span <= 60)).sum(), (span > 60).sum()))
+                smp = d[d.dis_id.isin(nt[nt > 1].index[:1])].drop_duplicates("disengage_time")
+                if len(smp):
+                    out("    例: dis_id=%s  disengage_time 取值: %s" % (smp.dis_id.iloc[0], " / ".join(map(str, smp.disengage_time.head(4)))))
             ev = d.drop_duplicates([vc, "disengage_time"]).copy()
             ev["vin"] = ev[vc].astype(str).str.upper().str.strip()
             ev["sec"] = to_sec(ev.disengage_time)
