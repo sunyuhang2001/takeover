@@ -26,6 +26,7 @@
 | 08_0920_lineage.py | v2 | 5373781a |
 | 09_provenance_bruteforce.py | v1 | 0d99804c |
 | 10_npy_events.py | v1 | bbd7c289 |
+| 11_event_lists.py | v1 | b24153d8 |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
@@ -73,3 +74,7 @@
   - 自动识别 labels：找出含 vin、时间和经纬度的二维数组。
   - 用 labels 还原出"全部脱离事件"清单，然后和 0920、自车视频事件比对重合情况；0920 和视频事件都会尝试 ±8h 时区偏移。
   - 顺带列出 processing_data 的目录结构。
+- **11_event_lists.py**：把三份事件清单补全，分三部分：
+  - **A. dis_joined3 多出的事件**：dis_joined3_30s / 60s 比 0920 多出若干事件。检查这些事件的标签是否齐全、按月怎么分布、是不是 0920 事件换了个时间。
+  - **B. 从 switch 导出数据里找全部脱离**：switch 导出数据带 drive_mode_switch 字段，记录驾驶模式的状态。按 VIN 找出状态切换的时刻，用 0920 判断哪个切换方向是"自动→人工"，从而得到全部脱离事件，补上 NPY 缺的 2024 年。
+  - **C. 视频事件的归属**：对每个视频事件，判断它是否在"全部脱离"里、是否在"关键脱离"（critical_label*.npy）里，并按月统计。
