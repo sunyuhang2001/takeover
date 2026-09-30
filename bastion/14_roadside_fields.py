@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-# 14_roadside_fields.py v2 : 路侧数据统计 + 理想字段表(V2.04, 110 个字段)与现有数据的映射 + 各等级补充方案（只读）
+# 14_roadside_fields.py v3 : 路侧数据统计 + 理想字段表(V2.04, 110 个字段)与现有数据的映射 + 各等级补充方案（只读）
 #   输入: 12 的 事件资产表.csv / 事件资产表_2025.csv、04 的 table_catalog.csv；重新扫盘找龙门架视频与路侧 json
 #   [1] 路侧: 龙门架视频(案例目录/路口/相机/分辨率/时长) 与 路侧 json(各类型文件/时段/字段样例/频率)
 #   [2] 事件层面: 每个等级(A–H/X, 2025 单列)有龙门架 / 有 json 的事件
 #   [3] 现有数据源的列名清点(轨迹表 / 0920 / switch 平台表 / 运行安全评价 / NPY)
 #   [4] switch 平台表按 VIN+时间匹配事件, 取 manual_reason(退出原因候选)
 #   [5] 字段映射: 每个字段按"规定动作"顺序判断每个事件能否获得 -> 字段映射表.xlsx(总表 + 每个等级一张表)
-#   规定动作: D 直接读取 / C 计算推导 / L 已有人工标注(0920台账) / R 路侧提取 / V 视频人工标注 / X 外部数据补充 / Q 向企业申请 / N 无法补充
+#   规定动作: D 直接读取 / C 计算推导 / L 已有人工标注(0920台账) / R 路侧提取 / M 模型恢复 / V 视频人工审计 / X 外部地图 / W 外部气象 / N 无法补充
 # 用法: python 14_roadside_fields.py [根目录...]   (默认 C:\ D:\)
 import os, sys, re, json, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "14_roadside_fields", "v2"
+NAME, VERSION = "14_roadside_fields", "v3"
 BASE = r"D:\takeover_audit"
 IN12 = BASE + r"\12_verify"
 CATALOG = BASE + r"\04_tables\table_catalog.csv"
@@ -30,10 +30,11 @@ SHIFTS = (0, 8 * 3600, -8 * 3600)
 RS_COLS = {"participant": "路侧_周边交通参与者", "vehicle_track": "路侧_车辆轨迹", "traffic_flow": "路侧_交通流",
            "signal": "路侧_信号配时", "event": "路侧_路侧事件"}
 
-ACT = {"D": "直接读取", "C": "计算推导", "L": "已有人工标注(0920)", "R": "路侧提取", "V": "视频人工标注",
-       "X": "外部数据补充", "Q": "向企业申请", "N": "无法补充"}
+ACT = {"D": "直接读取", "C": "计算推导", "L": "已有人工标注(0920)", "R": "路侧提取", "M": "模型恢复",
+       "V": "视频人工审计", "X": "外部地图数据", "W": "外部气象数据", "N": "无法补充"}
 HAVE = ("D", "C", "L", "R")          # 现有数据即可
-ABLE = HAVE + ("V", "X")             # 可补充
+ABLE = HAVE + ("M", "V", "X", "W")   # 可补充
+# 外部数据只用两类: 地图(OSM/高德/百度路网, 有条件用高精地图) 与 历史气象(按日期+位置查站点/再分析数据)
 
 # 理想字段表 V2.04：(模块, 字段, 优先级)
 SPEC = [
@@ -108,135 +109,143 @@ COLS = {
     "upload": r"receive|upload|report|insert|create|入库|上报",
     "ads_status": r"ads_?status|auto\w*_?(?:state|status)|system_?status",
 }
-# 每个字段的规定动作顺序：(动作, 条件, 数据来源, 做法)。事件取第一个条件成立的动作；Q/N 为兜底
+# 每个字段的规定动作顺序：(动作, 条件, 数据来源, 做法)。事件取第一个条件成立的动作；都不成立 = N 无法补充
+#   条件: all/e9/traj/npy/anytraj/ch1/ch2/ch3/ch2a(座舱有音轨)/anyvid/gantry/rsp/rsig/revent/tsa/sw/lvi/col:<列>
 R_ = lambda *a: a
+VO = "单目视觉里程计/SLAM：从前视视频恢复自车相对轨迹，再用路口/地图配准到经纬度"
+MOT = "路口视频多目标跟踪 + 相机标定(用地图/车道线求单应矩阵) → 各目标轨迹"
+DET = "前视视频目标检测 + 单目测距/跟踪"
+DMS = "座舱视频 DMS 模型(人脸关键点、视线、闭眼、手部检测) + 人工抽检"
+PEDAL = "踏板视频动作识别(脚部检测/踏板区域帧差) + 人工抽检"
 RULES = {
     "样本类型": [R_("L", "e9", "0920 是否紧急接管", "接管事件；按“是否紧急接管”分安全/不安全接管"),
-             R_("C", "dm_or_npy", "轨迹 drive_mode 1→0 / NPY", "有 1→0 即接管完成；用加速度阈值区分不安全接管"),
-             R_("V", "ch1", "前视视频", "人工判定接管结果"), R_("N", "all", "-", "无接管记录")],
+             R_("C", "dm_or_npy", "drive_mode 1→0 / NPY", "有 1→0 即接管完成；加速度阈值区分不安全接管"),
+             R_("V", "anyvid", "视频", "人工审计判定接管结果")],
     "自动驾驶运行里程与运行时长": [R_("C", "lvi", "local_vehicle_info 连续导出", "按 VIN 累计 drive_mode=1 的时长与经纬度里程"),
-                        R_("Q", "all", "-", "需企业提供车队运行里程")],
+                        R_("C", "anytraj", "事件所在文件", "仅能给窗口内时长，全局暴露率需连续数据")],
     "车辆识别码": [R_("D", "all", "路径/表格 vin", "直接读取")],
     "事件编号": [R_("C", "all", "event_key", "VIN_YYYYMMDD_HHMMSS")],
-    "数据创建时间": [R_("N", "all", "-", "历史导出未保留；可用文件时间代替")],
-    "数据上报时间": [R_("D", "col:upload", "轨迹表上报/入库时间列", "直接读取"), R_("N", "all", "-", "未保留")],
-    "车端时间戳": [R_("D", "traj", "轨迹 position_time", "直接读取(注意 UTC +8h)"),
-              R_("C", "npy", "NPY labels 时间", "labels 时间 + 帧序号"), R_("N", "all", "-", "无轨迹")],
+    "数据创建时间": [R_("C", "all", "导出文件时间", "用源文件修改时间近似，标注“近似”")],
+    "数据上报时间": [R_("D", "col:upload", "表中上报/入库时间列", "直接读取"), R_("C", "sw", "switch 平台记录时间", "平台记录时间近似上报时间")],
+    "车端时间戳": [R_("D", "traj", "轨迹 position_time", "直接读取(注意 UTC +8h)"), R_("C", "npy", "NPY labels 时间", "labels 时间 + 帧序号"),
+              R_("C", "anyvid", "视频文件名起止时间", "片段起点 + 帧号/帧率")],
     "数据来源": [R_("C", "all", "资产表来源列", "按来源文件填写")],
-    "采样频率": [R_("C", "anytraj", "轨迹采样间隔 / NPY 1 Hz", "由相邻点间隔计算"), R_("N", "all", "-", "无轨迹")],
-    "控制模式": [R_("D", "col:drive_mode", "轨迹 drive_mode", "直接读取(1 自动 / 0 人工)"),
-             R_("D", "sw", "switch 平台表", "drive_mode_switch"),
-             R_("C", "npy", "NPY", "样本本身即 1→0 切换，前 20 s 自动、后 10 s 人工"), R_("N", "all", "-", "-")],
-    "自动驾驶系统运行状态": [R_("D", "col:ads_status", "轨迹表", "直接读取"),
-                   R_("C", "dm_or_npy", "drive_mode", "drive_mode=1 视为运行；异常/降级无法区分"), R_("Q", "all", "-", "需 ADS 日志")],
-    "当前激活的ADS功能": [R_("Q", "all", "-", "需企业说明(可按车队统一填写，如城市 Robotaxi)")],
-    "系统降级状态": [R_("Q", "all", "-", "需 ADS 日志")],
-    "自动驾驶退出原因": [R_("D", "swreason", "switch 平台表 manual_reason", "直接读取"),
-                 R_("L", "e9", "0920 描述", "由描述人工归类到退出原因枚举"),
-                 R_("V", "ch1", "前视+座舱视频", "人工判定"), R_("N", "all", "-", "-")],
-    "最小风险策略状态": [R_("Q", "all", "-", "需 ADS 日志")],
-    "接管完成状态": [R_("C", "dm_or_npy", "drive_mode 1→0", "发生 1→0 即接管完成"),
-               R_("L", "e9", "0920", "台账即已接管"), R_("V", "ch1", "视频", "人工判定"), R_("N", "all", "-", "-")],
-    "远程控制状态": [R_("Q", "all", "-", "需平台日志")],
-    "ODD运行状态": [R_("V", "ch1", "前视视频", "人工判定是否超出 ODD"), R_("Q", "all", "-", "需企业 ODD 定义")],
-    "ODD退出原因": [R_("V", "ch1", "前视视频", "人工归类"), R_("Q", "all", "-", "-")],
-    "功能边界类型": [R_("V", "ch1", "前视视频(+0920 描述)", "人工归类"), R_("L", "e9", "0920 描述", "人工归类"), R_("N", "all", "-", "-")],
-    "最小风险策略触发原因": [R_("Q", "all", "-", "需 ADS 日志")],
-    "是否发出接管请求": [R_("V", "ch2", "座舱视频", "看/听 HMI 提示(需确认画面拍到屏幕或有音轨)"), R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "接管请求开始时间": [R_("V", "ch2", "座舱视频", "同上，取提示出现时刻"), R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "接管请求原因": [R_("L", "e9", "0920 描述", "人工归类"), R_("V", "ch1", "视频", "人工归类"), R_("Q", "all", "-", "-")],
-    "接管紧急等级": [R_("L", "e9", "0920 是否紧急接管", "直接映射"), R_("C", "anytraj_acc", "轨迹/NPY 加速度", "阈值规则分级"),
-               R_("N", "all", "-", "-")],
-    "告警形式": [R_("V", "ch2", "座舱视频", "人工判定视觉/声音"), R_("Q", "all", "-", "需 HMI 说明")],
-    "视觉告警": [R_("Q", "all", "-", "需 HMI 截图/录屏与设计说明")],
-    "听觉告警": [R_("Q", "all", "-", "需 HMI 设计说明")],
-    "触觉告警": [R_("Q", "all", "-", "需 HMI 设计说明")],
-    "第一阶段告警开始、结束时间": [R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "第二阶段告警开始、结束时间": [R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "第三阶段告警开始、结束时间": [R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "告警是否升级": [R_("Q", "all", "-", "需 HMI/ADS 日志")],
-    "ADS事件": [R_("C", "dm_or_npy", "drive_mode", "只能得到“退出”；激活/请求/MRM 需日志"), R_("Q", "all", "-", "需 ADS 日志")],
-    "失效事件": [R_("Q", "all", "-", "需 ADS 日志")],
-    "驾驶员是否手握方向盘": [R_("V", "ch2", "座舱视频", "人工标注")], "驾驶员是否在正常驾驶位": [R_("V", "ch2", "座舱视频", "人工标注")],
-    "安全带状态": [R_("V", "ch2", "座舱视频", "人工标注(主驾)")], "驾驶员注意力状态": [R_("V", "ch2", "座舱视频", "人工标注")],
-    "驾驶员疲劳状态": [R_("V", "ch2", "座舱视频", "人工标注")], "驾驶员视线方向": [R_("V", "ch2", "座舱视频", "人工标注")],
-    "驾驶员接管反应时间": [R_("V", "ch1_ch2", "前视+座舱视频", "风险出现(前视)→手/脚动作(座舱/踏板)；无接管请求时间时按此口径")],
+    "采样频率": [R_("C", "anytraj", "轨迹采样间隔 / NPY 1 Hz", "相邻点间隔"), R_("C", "anyvid", "视频帧率", "视频 fps")],
+    "控制模式": [R_("D", "col:drive_mode", "drive_mode 列", "直接读取(1 自动 / 0 人工)"), R_("D", "sw", "switch 平台表", "drive_mode_switch"),
+             R_("C", "npy", "NPY", "样本即 1→0：前 20 s 自动、后 10 s 人工"),
+             R_("V", "ch2", "座舱视频", "看 HMI 模式显示/安全员接手时刻")],
+    "自动驾驶系统运行状态": [R_("D", "col:ads_status", "表格", "直接读取"), R_("C", "dm_or_npy", "drive_mode", "drive_mode=1 视为运行"),
+                   R_("V", "ch2", "座舱视频", "看 HMI 状态显示")],
+    "当前激活的ADS功能": [R_("C", "all", "车队运营属性", "城市道路 Robotaxi 统一填写；需核对车队"), ],
+    "系统降级状态": [R_("V", "ch2", "座舱视频", "看 HMI 降级提示"), R_("C", "anytraj", "轨迹", "限速/减速等行为特征推断(弱)")],
+    "自动驾驶退出原因": [R_("D", "swreason", "switch manual_reason", "直接读取"), R_("L", "e9", "0920 描述", "文本归类到退出原因枚举"),
+                 R_("V", "ch1", "前视+座舱视频", "人工审计归类"), R_("V", "gantry", "龙门架视频", "人工审计归类")],
+    "最小风险策略状态": [R_("V", "ch1", "前视+座舱视频", "看是否靠边/停车(MRM 行为)"), R_("C", "anytraj", "轨迹", "接管前是否减速至停车")],
+    "接管完成状态": [R_("C", "dm_or_npy", "drive_mode 1→0", "发生 1→0 即接管完成"), R_("L", "e9", "0920", "台账即已接管"),
+               R_("V", "anyvid", "视频", "人工审计")],
+    "远程控制状态": [R_("L", "e9", "0920 描述", "描述中是否远程接管"), R_("V", "ch2", "座舱视频", "安全员是否操作")],
+    "ODD运行状态": [R_("V", "ch1", "前视视频", "按 ODD 定义人工判定"), R_("X", "anytraj", "地图", "道路等级/区域是否在 ODD 内")],
+    "ODD退出原因": [R_("V", "ch1", "前视视频", "人工归类"), R_("L", "e9", "0920 描述", "文本归类")],
+    "功能边界类型": [R_("V", "ch1", "前视视频(+0920 描述)", "人工归类"), R_("L", "e9", "0920 描述", "文本归类")],
+    "最小风险策略触发原因": [R_("V", "ch1", "前视+座舱视频", "人工归类"), R_("L", "e9", "0920 描述", "文本归类")],
+    "是否发出接管请求": [R_("M", "ch2a", "座舱视频音轨", "提示音检测"), R_("V", "ch2", "座舱视频", "看 HMI 弹窗；拍不到屏幕则按安全员行为判断主动/被动"),
+                 R_("L", "e9", "0920 描述", "关键词(提示/请求/报警/主动)")],
+    "接管请求开始时间": [R_("M", "ch2a", "座舱视频音轨", "提示音起点"), R_("V", "ch2", "座舱视频", "HMI 弹窗出现帧")],
+    "接管请求原因": [R_("L", "e9", "0920 描述", "文本归类"), R_("V", "ch1", "视频", "人工归类")],
+    "接管紧急等级": [R_("L", "e9", "0920 是否紧急接管", "直接映射"), R_("C", "anytraj", "轨迹/NPY 加速度", "阈值规则分级"),
+               R_("V", "anyvid", "视频", "人工分级")],
+    "告警形式": [R_("M", "ch2a", "座舱视频音轨", "有提示音=声音"), R_("V", "ch2", "座舱视频", "看屏幕/听声音")],
+    "视觉告警": [R_("V", "ch2", "座舱视频", "截取 HMI 画面(文字/图标/颜色/是否倒计时)；字号、亮度等无法从历史视频得到")],
+    "听觉告警": [R_("M", "ch2a", "座舱视频音轨", "提示音时长/间隔/重复次数、语音转文字；声压级无法得到")],
+    "触觉告警": [R_("V", "ch2", "座舱视频", "只能看到安全员对振动的反应(弱)，振动参数无法补充")],
+    "第一阶段告警开始、结束时间": [R_("M", "ch2a", "座舱视频音轨", "提示音分段"), R_("V", "ch2", "座舱视频", "HMI 画面分段")],
+    "第二阶段告警开始、结束时间": [R_("M", "ch2a", "座舱视频音轨", "提示音分段"), R_("V", "ch2", "座舱视频", "HMI 画面分段")],
+    "第三阶段告警开始、结束时间": [R_("M", "ch2a", "座舱视频音轨", "提示音分段"), R_("V", "ch2", "座舱视频", "HMI 画面分段")],
+    "告警是否升级": [R_("M", "ch2a", "座舱视频音轨", "提示音频率/音量变化"), R_("V", "ch2", "座舱视频", "HMI 变化")],
+    "ADS事件": [R_("C", "dm_or_npy", "drive_mode", "退出时刻；激活时刻由 0→1 得到"), R_("V", "ch2", "座舱视频", "HMI 状态")],
+    "失效事件": [R_("L", "e9", "0920 描述", "文本归类(感知/定位/规划…)"), R_("V", "ch1", "前视+座舱视频", "人工归类")],
+    "驾驶员是否手握方向盘": [R_("M", "ch2", "座舱视频", DMS)], "驾驶员是否在正常驾驶位": [R_("M", "ch2", "座舱视频", DMS)],
+    "安全带状态": [R_("V", "ch2", "座舱视频", "人工审计(主驾)")], "驾驶员注意力状态": [R_("M", "ch2", "座舱视频", DMS)],
+    "驾驶员疲劳状态": [R_("M", "ch2", "座舱视频", DMS)], "驾驶员视线方向": [R_("M", "ch2", "座舱视频", DMS)],
+    "驾驶员接管反应时间": [R_("V", "ch1_ch2", "前视+座舱/踏板视频", "请求或风险出现 → 手/脚动作，逐帧标注")],
     "驾驶员状态视频证据": [R_("D", "ch2", "座舱视频 ch2", "原始视频")],
-    "驾驶员制动油门反应时间": [R_("V", "ch3", "踏板视频", "人工标注脚到达踏板时刻")],
-    "手握方向盘时间": [R_("V", "ch2", "座舱视频", "人工标注")],
-    "车辆速度": [R_("D", "col:speed", "轨迹表速度列", "直接读取"), R_("D", "npy", "NPY 第 1 维", "直接读取"),
-             R_("C", "traj", "经纬度", "相邻点距离/时间"), R_("N", "all", "-", "-")],
-    "纵向加速度": [R_("D", "col:acc_long", "轨迹表", "直接读取"), R_("D", "npy", "NPY", "直接读取"),
-              R_("C", "col:speed", "速度", "差分"), R_("C", "traj", "经纬度", "二次差分(噪声大)"), R_("N", "all", "-", "-")],
-    "横向加速度": [R_("D", "col:acc_lat", "轨迹表", "直接读取"), R_("D", "npy", "NPY", "直接读取"),
-              R_("C", "traj", "速度×航向变化率", "计算"), R_("N", "all", "-", "-")],
-    "航向角": [R_("D", "col:heading", "轨迹表", "直接读取"), R_("C", "anytraj", "经纬度", "相邻点方位角"), R_("N", "all", "-", "-")],
-    "方向盘角度": [R_("D", "col:steer", "轨迹表", "直接读取"), R_("Q", "all", "-", "需 CAN 数据")],
-    "方向盘角速度": [R_("D", "col:steer", "轨迹表", "角度差分"), R_("Q", "all", "-", "需 CAN 数据")],
-    "制动状态": [R_("D", "col:brake", "轨迹表", "直接读取"), R_("V", "ch3", "踏板视频", "人工标注踩/未踩"), R_("Q", "all", "-", "需 CAN")],
-    "制动踏板开度": [R_("D", "col:brake", "轨迹表", "直接读取"), R_("V", "ch3", "踏板视频", "只能粗分深/浅"), R_("Q", "all", "-", "需 CAN")],
-    "加速踏板开度": [R_("D", "col:throttle", "轨迹表", "直接读取"), R_("V", "ch3", "踏板视频", "只能粗分"), R_("Q", "all", "-", "需 CAN")],
-    "档位": [R_("D", "col:gear", "轨迹表", "直接读取"), R_("C", "anytraj", "速度", "行驶中视为 D 档(弱推断)"), R_("Q", "all", "-", "需 CAN")],
-    "前车距离": [R_("R", "rsp", "路侧 participant", "同车道前方最近目标距离"), R_("V", "ch1", "前视视频", "人工估计"), R_("Q", "all", "-", "需感知数据")],
-    "碰撞方向": [R_("V", "ch1", "前视视频", "人工判定(无碰撞填无)"), R_("V", "gantry", "龙门架视频", "人工判定"), R_("N", "all", "-", "-")],
-    "气囊状态": [R_("Q", "all", "-", "需事故/车辆数据")],
-    "首次制动时间": [R_("D", "col:brake", "轨迹表", "首个制动时刻"), R_("V", "ch3", "踏板视频", "人工标注"),
-               R_("C", "anytraj_acc", "纵向加速度", "减速起点作代理"), R_("N", "all", "-", "-")],
-    "首次转向时间": [R_("D", "col:steer", "轨迹表", "首个转向时刻"), R_("C", "anytraj", "航向变化率", "代理"), R_("V", "ch1", "视频", "人工"), R_("N", "all", "-", "-")],
-    "首次油门操作时间": [R_("D", "col:throttle", "轨迹表", "直接读取"), R_("V", "ch3", "踏板视频", "人工标注"), R_("N", "all", "-", "-")],
-    "接管操作类型": [R_("V", "ch3", "踏板+座舱视频", "人工标注制动/转向/组合"), R_("C", "anytraj_acc", "加速度/航向", "规则判定"),
-               R_("L", "e9", "0920 主车行为", "映射"), R_("N", "all", "-", "-")],
-    "经度": [R_("D", "anytraj", "轨迹/NPY 经度", "直接读取"), R_("N", "all", "-", "-")],
-    "纬度": [R_("D", "anytraj", "轨迹/NPY 纬度", "直接读取"), R_("N", "all", "-", "-")],
-    "坐标类型": [R_("X", "anytraj", "底图叠加核对", "叠到 WGS84/GCJ02 底图判断，需企业确认"), R_("Q", "all", "-", "-")],
-    "定位有效性": [R_("C", "anytraj", "经纬度", "非零、无跳点即有效"), R_("N", "all", "-", "-")],
-    "GNSS运行状态": [R_("Q", "all", "-", "需定位日志")], "IMU运行状态": [R_("Q", "all", "-", "需定位日志")],
-    "地图匹配状态": [R_("X", "anytraj", "路网", "轨迹做地图匹配"), R_("Q", "all", "-", "-")],
-    "道路类型": [R_("L", "e9", "0920 道路类型", "直接映射"), R_("V", "ch1", "前视视频", "人工标注"), R_("X", "anytraj", "路网", "地图匹配后读道路等级")],
-    "车道类型": [R_("V", "ch1", "前视视频", "人工标注"), R_("X", "anytraj", "高精地图", "需地图"), R_("Q", "all", "-", "-")],
-    "车道编号": [R_("V", "ch1", "前视视频", "人工标注"), R_("X", "anytraj", "高精地图", "需地图"), R_("Q", "all", "-", "-")],
-    "道路限速": [R_("X", "anytraj", "路网/OSM", "地图匹配后读限速"), R_("V", "ch1", "前视视频", "看标志"), R_("Q", "all", "-", "-")],
-    "特殊区域边界": [R_("X", "all", "GIS", "需园区/地库边界 GIS；当前为城市道路")],
+    "驾驶员制动油门反应时间": [R_("M", "ch3", "踏板视频", PEDAL)],
+    "手握方向盘时间": [R_("M", "ch2", "座舱视频", "手部检测，取手接触方向盘帧")],
+    "车辆速度": [R_("D", "col:speed", "速度列", "直接读取"), R_("D", "npy", "NPY 第 1 维", "直接读取"),
+             R_("C", "anytraj", "经纬度", "相邻点距离/时间"), R_("M", "ch1", "前视视频", VO)],
+    "纵向加速度": [R_("D", "col:acc_long", "纵向加速度列", "直接读取"), R_("D", "npy", "NPY", "直接读取"),
+              R_("C", "anytraj", "速度/经纬度", "差分"), R_("M", "ch1", "前视视频", VO)],
+    "横向加速度": [R_("D", "col:acc_lat", "横向加速度列", "直接读取"), R_("D", "npy", "NPY", "直接读取"),
+              R_("C", "anytraj", "速度×航向变化率", "计算"), R_("M", "ch1", "前视视频", VO)],
+    "航向角": [R_("D", "col:heading", "航向列", "直接读取"), R_("C", "anytraj", "经纬度", "相邻点方位角"), R_("M", "ch1", "前视视频", VO)],
+    "方向盘角度": [R_("D", "col:steer", "方向盘列", "直接读取"), R_("C", "anytraj", "横摆角速度+车速", "自行车模型反推(需轴距/转向比)"),
+              R_("M", "ch2", "座舱视频", "方向盘关键点姿态估计")],
+    "方向盘角速度": [R_("D", "col:steer", "方向盘列", "角度差分"), R_("C", "anytraj", "反推的方向盘角度", "差分")],
+    "制动状态": [R_("D", "col:brake", "制动列", "直接读取"), R_("M", "ch3", "踏板视频", PEDAL), R_("C", "anytraj", "纵向加速度", "减速度超阈值视为制动")],
+    "制动踏板开度": [R_("D", "col:brake", "制动列", "直接读取"), R_("M", "ch3", "踏板视频", "踏板角度估计(粗)"), R_("C", "anytraj", "减速度", "按制动特性反推(粗)")],
+    "加速踏板开度": [R_("D", "col:throttle", "油门列", "直接读取"), R_("M", "ch3", "踏板视频", "踏板角度估计(粗)"), R_("C", "anytraj", "加速度", "反推(粗)")],
+    "档位": [R_("D", "col:gear", "档位列", "直接读取"), R_("C", "anytraj", "速度", "行驶中为 D 档"), R_("V", "anyvid", "视频", "倒车/停车可见")],
+    "前车距离": [R_("R", "rsp", "路侧 participant", "同车道前方最近目标距离"), R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "碰撞方向": [R_("V", "ch1", "前视视频", "人工审计(无碰撞填无)"), R_("V", "gantry", "龙门架视频", "人工审计"), R_("C", "anytraj", "加速度突变方向", "冲击方向推断")],
+    "气囊状态": [R_("V", "ch2", "座舱视频", "是否弹出"), R_("C", "anytraj", "加速度", "无碰撞冲击即未触发")],
+    "首次制动时间": [R_("D", "col:brake", "制动列", "首个制动时刻"), R_("M", "ch3", "踏板视频", PEDAL), R_("C", "anytraj", "纵向加速度", "减速起点作代理")],
+    "首次转向时间": [R_("D", "col:steer", "方向盘列", "首个转向时刻"), R_("C", "anytraj", "航向变化率", "代理"), R_("M", "ch2", "座舱视频", "手部/方向盘转动检测")],
+    "首次油门操作时间": [R_("D", "col:throttle", "油门列", "直接读取"), R_("M", "ch3", "踏板视频", PEDAL), R_("C", "anytraj", "加速度", "加速起点作代理")],
+    "接管操作类型": [R_("M", "ch3", "踏板+座舱视频", "制动/转向/组合识别"), R_("C", "anytraj", "加速度/航向", "规则判定"), R_("L", "e9", "0920 主车行为", "映射")],
+    "经度": [R_("D", "anytraj", "轨迹/NPY 经度", "直接读取"), R_("M", "ch1", "前视视频", VO), R_("C", "e9", "0920 cross_name1", "路口坐标近似")],
+    "纬度": [R_("D", "anytraj", "轨迹/NPY 纬度", "直接读取"), R_("M", "ch1", "前视视频", VO), R_("C", "e9", "0920 cross_name1", "路口坐标近似")],
+    "坐标类型": [R_("C", "anytraj", "底图叠加", "GCJ02 与 WGS84 偏差约数百米，叠到道路底图可判定")],
+    "定位有效性": [R_("C", "anytraj", "经纬度", "非零、无跳点即有效")],
+    "GNSS运行状态": [R_("C", "anytraj", "轨迹", "缺点/跳点/静止漂移推断定位异常(代理)")],
+    "IMU运行状态": [R_("C", "anytraj", "轨迹", "加速度/航向连续性推断(代理)")],
+    "地图匹配状态": [R_("X", "anytraj", "路网(OSM/高精地图)", "轨迹地图匹配，输出匹配置信度")],
+    "道路类型": [R_("L", "e9", "0920 道路类型", "直接映射"), R_("X", "anytraj", "路网", "地图匹配后读道路等级"), R_("V", "anyvid", "视频", "人工标注")],
+    "车道类型": [R_("M", "ch1", "前视视频", "车道线/路面标识检测"), R_("X", "anytraj", "高精地图", "地图匹配"), R_("V", "gantry", "龙门架视频", "人工")],
+    "车道编号": [R_("M", "ch1", "前视视频", "车道线检测定位所在车道"), R_("M", "gantry", "龙门架视频", MOT), R_("X", "anytraj", "高精地图", "车道级匹配")],
+    "道路限速": [R_("X", "anytraj", "路网/OSM", "地图匹配后读限速"), R_("M", "ch1", "前视视频", "限速标志识别")],
+    "特殊区域边界": [R_("X", "anytraj_or_e9", "地图(OSM/高德 POI)", "园区、停车场、地库多边形；当前事件均为城市道路")],
     "感知目标物类型": [R_("R", "rsp", "participant ptcType", "直接读取"), R_("L", "e9", "0920 目标物", "映射"),
-                 R_("V", "ch1", "前视视频", "人工标注"), R_("V", "gantry", "龙门架视频", "人工标注"), R_("Q", "all", "-", "需车端感知")],
-    "目标物相对位置X向": [R_("R", "rsp_traj", "participant + 自车轨迹", "转到自车坐标系"), R_("V", "ch1", "前视视频", "人工估计(粗)"), R_("Q", "all", "-", "需车端感知")],
-    "目标物相对位置Y向": [R_("R", "rsp_traj", "participant + 自车轨迹", "转到自车坐标系"), R_("V", "ch1", "前视视频", "人工估计(粗)"), R_("Q", "all", "-", "需车端感知")],
-    "目标物相对速度X向": [R_("R", "rsp_traj", "participant + 自车轨迹", "速度差投影"), R_("Q", "all", "-", "需车端感知")],
-    "目标物相对速度Y向": [R_("R", "rsp_traj", "participant + 自车轨迹", "速度差投影"), R_("Q", "all", "-", "需车端感知")],
-    "目标物长度": [R_("R", "rsp", "participant ptcSizeLength", "直接读取"), R_("Q", "all", "-", "-")],
-    "目标物高度": [R_("R", "rsp", "participant ptcSizeHeight", "直接读取"), R_("Q", "all", "-", "-")],
-    "目标物宽度": [R_("R", "rsp", "participant ptcSizeWidth", "直接读取"), R_("Q", "all", "-", "-")],
-    "目标物置信度": [R_("R", "rsp_conf", "participant 置信度字段", "直接读取"), R_("Q", "all", "-", "-")],
-    "目标物编号": [R_("R", "rsp", "participant ptcId", "直接读取"), R_("V", "ch1", "视频", "人工编号"), R_("Q", "all", "-", "-")],
-    "碰撞时间": [R_("R", "tsa", "运行安全评价 con_res", "已算好的 TTC"), R_("R", "rsp_traj", "participant + 自车轨迹", "计算 TTC"),
-             R_("V", "ch1", "前视视频", "人工估计(粗)"), R_("Q", "all", "-", "需感知")],
-    "与目标物最小距离": [R_("R", "rsp_traj", "participant + 自车轨迹", "窗口内最小距离"), R_("V", "ch1", "前视视频", "人工估计(粗)"), R_("Q", "all", "-", "需感知")],
-    "系统风险等级": [R_("C", "anytraj_acc", "加速度 / TTC", "按阈值规则分级"), R_("N", "all", "-", "-")],
-    "交通主标志": [R_("V", "ch1", "前视视频", "人工标注"), R_("X", "anytraj", "地图 POI", "需地图"), R_("N", "all", "-", "-")],
-    "交通管制信息": [R_("R", "revent", "路侧 event", "直接读取"), R_("V", "ch1", "前视视频", "人工标注"), R_("N", "all", "-", "-")],
+                 R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "目标物相对位置X向": [R_("R", "rsp_traj", "participant + 自车轨迹", "转到自车坐标系"), R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "目标物相对位置Y向": [R_("R", "rsp_traj", "participant + 自车轨迹", "转到自车坐标系"), R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "目标物相对速度X向": [R_("R", "rsp_traj", "participant + 自车轨迹", "速度差投影"), R_("M", "ch1", "前视视频", DET + "，跟踪求导"), R_("M", "gantry", "龙门架视频", MOT)],
+    "目标物相对速度Y向": [R_("R", "rsp_traj", "participant + 自车轨迹", "速度差投影"), R_("M", "ch1", "前视视频", DET + "，跟踪求导"), R_("M", "gantry", "龙门架视频", MOT)],
+    "目标物长度": [R_("R", "rsp", "participant ptcSizeLength", "直接读取"), R_("M", "anyvid_ext", "视频检测框", "按类型取典型尺寸/3D 检测")],
+    "目标物高度": [R_("R", "rsp", "participant ptcSizeHeight", "直接读取"), R_("M", "anyvid_ext", "视频检测框", "按类型取典型尺寸/3D 检测")],
+    "目标物宽度": [R_("R", "rsp", "participant ptcSizeWidth", "直接读取"), R_("M", "anyvid_ext", "视频检测框", "按类型取典型尺寸/3D 检测")],
+    "目标物置信度": [R_("R", "rsp_conf", "participant 置信度字段", "直接读取"), R_("M", "anyvid_ext", "检测模型", "模型输出置信度")],
+    "目标物编号": [R_("R", "rsp", "participant ptcId", "直接读取"), R_("M", "anyvid_ext", "视频跟踪", "跟踪 ID")],
+    "碰撞时间": [R_("R", "tsa", "运行安全评价", "已算好的 TTC(待核对列名)"), R_("R", "rsp_traj", "participant + 自车轨迹", "计算 TTC"),
+             R_("M", "ch1", "前视视频", DET + " → TTC"), R_("M", "gantry", "龙门架视频", MOT + " → TTC")],
+    "与目标物最小距离": [R_("R", "rsp_traj", "participant + 自车轨迹", "窗口内最小距离"), R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "系统风险等级": [R_("C", "anytraj", "加速度 / TTC", "按阈值规则分级"), R_("V", "anyvid", "视频", "人工分级")],
+    "交通主标志": [R_("M", "ch1", "前视视频", "交通标志识别"), R_("X", "anytraj", "地图 POI", "地图匹配")],
+    "交通管制信息": [R_("R", "revent", "路侧 event", "直接读取"), R_("V", "ch1", "前视视频", "人工标注"), R_("V", "gantry", "龙门架视频", "人工标注")],
     "前方信号灯识别": [R_("R", "rsig", "路侧 signal", "直接读取"), R_("L", "e9", "0920 交通灯", "映射"),
-                 R_("V", "ch1", "前视视频", "人工标注"), R_("V", "gantry", "龙门架视频", "人工标注"), R_("N", "all", "-", "-")],
-    "异常路况信息": [R_("R", "revent", "路侧 event", "直接读取"), R_("V", "ch1", "前视视频", "人工标注"), R_("N", "all", "-", "-")],
+                 R_("M", "ch1", "前视视频", "信号灯检测识别"), R_("V", "gantry", "龙门架视频", "人工标注")],
+    "异常路况信息": [R_("R", "revent", "路侧 event", "直接读取"), R_("V", "anyvid", "视频", "人工标注"), R_("V", "gantry", "龙门架视频", "人工标注")],
     "其他参数": [R_("R", "rsp", "participant/traffic_flow", "交通密度、参与者数量、平均车速"),
-             R_("V", "ch1", "前视视频", "遮挡、眩光、施工等人工标注"), R_("V", "gantry", "龙门架视频", "人工标注"),
+             R_("M", "ch1", "前视视频", "遮挡、眩光、施工、车流检测"), R_("M", "gantry", "龙门架视频", "车流统计"),
              R_("X", "anytraj", "地图", "曲率、坡度、车道宽度、交叉口类型")],
-    "车道线几何": [R_("X", "anytraj", "高精地图", "需地图"), R_("Q", "all", "-", "-")],
-    "障碍物类型": [R_("V", "ch1", "前视视频", "人工标注(地库场景才必填)"), R_("R", "rsp", "participant", "类型映射"), R_("N", "all", "-", "-")],
-    "天气信息": [R_("L", "e9", "0920 天气", "直接映射"), R_("V", "ch1", "前视视频", "人工标注"), R_("X", "all", "历史气象", "按日期+位置查")],
-    "外部光线": [R_("L", "e9", "0920 光线", "直接映射"), R_("V", "ch1", "前视视频", "人工标注"), R_("C", "all", "事件时间", "按日出日落推算")],
-    "外部温度": [R_("X", "all", "历史气象", "按日期+位置查")], "外部湿度": [R_("X", "all", "历史气象", "按日期+位置查")],
-    "能见度": [R_("X", "all", "历史气象", "按日期+位置查"), R_("V", "ch1", "前视视频", "粗估")],
-    "路面状态": [R_("V", "ch1", "前视视频", "人工标注"), R_("V", "gantry", "龙门架视频", "人工标注"), R_("X", "all", "历史气象", "按降水推断")],
-    "事故编号": [R_("N", "all", "-", "本批为接管事件，无事故材料(事故数据在其他账号堡垒机 D:\\SGSJ)")],
-    "事故发生时间": [R_("C", "all", "事件时间", "以接管时刻代替(非事故)")],
-    "事故地点": [R_("C", "anytraj", "轨迹经纬度 / 0920 cross_name1", "接管地点")],
-    "事故经过描述": [R_("L", "e9", "0920 描述", "直接读取"), R_("V", "ch1", "前视视频", "人工撰写"), R_("V", "gantry", "龙门架视频", "人工撰写"), R_("N", "all", "-", "-")],
-    "事故结果": [R_("V", "ch1", "前视视频", "人工判定碰撞/急刹/险情"), R_("C", "anytraj_acc", "加速度", "急刹/险情按阈值"), R_("N", "all", "-", "-")],
-    "损失程度": [R_("Q", "all", "-", "需事故材料")], "责任认定": [R_("Q", "all", "-", "需事故材料")],
-    "事故前后视频": [R_("D", "ch1", "前视视频", "原始视频"), R_("D", "gantry", "龙门架视频", "原始视频"), R_("N", "all", "-", "-")],
-    "事故位置和轨迹证据": [R_("D", "anytraj", "轨迹", "原始轨迹"), R_("N", "all", "-", "-")],
+    "车道线几何": [R_("X", "anytraj", "高精地图/OSM", "地图读取"), R_("M", "ch1", "前视视频", "车道线检测(相对几何)")],
+    "障碍物类型": [R_("R", "rsp", "participant", "类型映射"), R_("M", "ch1", "前视视频", DET), R_("M", "gantry", "龙门架视频", MOT)],
+    "天气信息": [R_("L", "e9", "0920 天气", "直接映射"), R_("W", "all", "历史气象", "按日期+位置查"), R_("V", "anyvid", "视频", "人工标注")],
+    "外部光线": [R_("L", "e9", "0920 光线", "直接映射"), R_("C", "all", "事件时间+位置", "日出日落推算"), R_("M", "anyvid", "视频", "画面亮度")],
+    "外部温度": [R_("W", "all", "历史气象", "按日期+位置查")], "外部湿度": [R_("W", "all", "历史气象", "按日期+位置查")],
+    "能见度": [R_("W", "all", "历史气象", "按日期+位置查"), R_("M", "anyvid", "视频", "图像能见度估计")],
+    "路面状态": [R_("M", "ch1", "前视视频", "路面湿滑/积水识别"), R_("V", "gantry", "龙门架视频", "人工标注"), R_("W", "all", "历史气象", "按降水/气温推断湿滑、结冰")],
+    "事故编号": [R_("C", "all", "event_key", "以事件编号作案例编号(非事故)")],
+    "事故发生时间": [R_("C", "all", "事件时间", "接管时刻")],
+    "事故地点": [R_("C", "anytraj", "轨迹经纬度", "接管地点"), R_("L", "e9", "0920 cross_name1", "路口名"), R_("V", "anyvid", "视频", "人工识别路口")],
+    "事故经过描述": [R_("L", "e9", "0920 描述", "直接读取"), R_("V", "anyvid", "视频", "人工撰写"), R_("V", "gantry", "龙门架视频", "人工撰写"),
+               R_("C", "anytraj", "轨迹", "按速度/加速度自动生成模板描述")],
+    "事故结果": [R_("V", "ch1", "前视视频", "人工判定碰撞/急刹/险情"), R_("V", "gantry", "龙门架视频", "人工判定"), R_("C", "anytraj", "加速度", "急刹/险情按阈值")],
+    "损失程度": [R_("V", "anyvid", "视频", "有无碰撞及程度"), R_("V", "gantry", "龙门架视频", "同上"), R_("C", "anytraj", "加速度", "无冲击即无损失")],
+    "责任认定": [R_("V", "anyvid", "视频", "按交通规则人工判定"), R_("V", "gantry", "龙门架视频", "同上")],
+    "事故前后视频": [R_("D", "ch1", "前视视频", "原始视频"), R_("D", "gantry", "龙门架视频", "原始视频"), R_("D", "anyvid", "车内视频", "原始视频")],
+    "事故位置和轨迹证据": [R_("D", "anytraj", "轨迹", "原始轨迹"), R_("M", "ch1", "前视视频", VO), R_("M", "gantry", "龙门架视频", MOT)],
     "是否真实接管失败案例": [R_("V", "ch1", "前视视频+轨迹", "人工判定"), R_("V", "gantry", "龙门架视频+轨迹", "人工判定"),
-                   R_("C", "anytraj_acc", "加速度", "仅能筛候选"), R_("N", "all", "-", "-")],
+                   R_("C", "anytraj", "加速度", "筛候选，需复核")],
 }
 
 
@@ -306,6 +315,32 @@ def probe(path):
         return dict(ok=-1, fps=0, w=0, h=0, dur=0)
 
 
+def colhas(colstr, pat):
+    """colstr = 逗号分隔的列名；逐列匹配(使 ^$ 锚点生效)"""
+    return any(re.search(pat, c.strip(), re.I) for c in str(colstr).split(",") if c.strip())
+
+
+def np_info(path):
+    try:
+        a = np.load(path, mmap_mode="r", allow_pickle=False)
+        return dict(shape=str(tuple(a.shape)), dtype=str(a.dtype))
+    except Exception as e:
+        return dict(shape="?", dtype=type(e).__name__)
+
+
+def has_audio(path):
+    """avi: strh 里有 auds；mp4/mov: 有 soun 轨。只读文件头/尾各 2MB"""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as f:
+            b = f.read(2 * 2**20)
+            if sz > 4 * 2**20:
+                f.seek(-2 * 2**20, 2); b += f.read()
+        return int(b"auds" in b or b"soun" in b)
+    except Exception:
+        return -1
+
+
 def json_schema(path, size):
     """小文件: 解析第一条记录的嵌套键; 大文件: 读前 2MB 用正则取键和样例值。返回 (记录结构说明, [(键, 样例)], 帧信息)"""
     head = open(path, "rb").read(2 * 1024 * 1024).decode("utf-8", "replace")
@@ -352,7 +387,7 @@ def main():
     out("资产表: 主表=%d  2025=%d" % (len(U), len(U25)))
 
     # ================= 1. 扫盘: 龙门架 / 路侧 json / 运行安全评价 / 地图 =================
-    gant, rsj, tsa, maps = [], [], [], []
+    gant, rsj, tsa, maps, PDNPY = [], [], [], [], []
     rs_conf = False
     for r in (sys.argv[1:] or ROOTS):
         if not os.path.exists(r):
@@ -370,6 +405,8 @@ def main():
                 rsj.append(dict(dir=d, name=n, size=sz, typ=p.group(1).lower(), s=p.group(2), e=p.group(3)))
             elif "运行安全评价" in d and ext in (".csv", ".xlsx"):
                 tsa.append(dict(dir=d, name=n, size=sz, sub=d.split("运行安全评价")[-1].strip("\\/").split("\\")[0].split("/")[0]))
+            elif ext == ".npy" and "processing_data" in d.lower():
+                PDNPY.append(os.path.join(d, n))
             elif ext in MAP_EXT:
                 maps.append(dict(dir=d, name=n, size=sz, ext=ext))
     G, P, T, M = pd.DataFrame(gant), pd.DataFrame(rsj), pd.DataFrame(tsa), pd.DataFrame(maps)
@@ -464,6 +501,19 @@ def main():
         out("  地图矢量: " + "  ".join("%s:%d" % (a, b) for a, b in M.ext.value_counts().items()) + "  目录: " +
             "  ".join("%s:%d" % (a[-40:], b) for a, b in M.dir.value_counts().head(4).items()))
 
+    # ---- 1d 自车视频是否带音轨(接管提示音) ----
+    out("")
+    out("################ 1d 自车视频音轨 ################")
+    for c in "123":
+        col = "ch%s_原始路径" % c
+        E["ch%s_audio" % c] = False
+        if col in E.columns:
+            ps = E[col].fillna("").astype(str).str.split(";").str[0]
+            au = {p: has_audio(p) for p in set(ps) if p and os.path.exists(p)}
+            E["ch%s_audio" % c] = ps.map(lambda p: au.get(p, 0) == 1)
+            out("  ch%s: 检查文件=%d  有音轨=%d  无=%d  读失败=%d" % (c, len(au), sum(v == 1 for v in au.values()),
+                sum(v == 0 for v in au.values()), sum(v == -1 for v in au.values())))
+
     # ================= 2. 事件层面: 各等级有哪些路侧 =================
     out("")
     out("################ 2 各等级事件的路侧数据 ################")
@@ -505,76 +555,120 @@ def main():
     used = set(E.loc[E["有表格轨迹"], "轨迹_原始文件"])
     E["_cols"] = E["轨迹_原始文件"].map(lambda p: colmap.get(p, "")).str.lower()
     out("  事件所用表格轨迹文件=%d, 其中含 → " % len(used) + "  ".join(
-        "%s:%d" % (k, sum(bool(re.search(v, colmap.get(p, ""), re.I)) for p in used)) for k, v in COLS.items()))
+        "%s:%d" % (k, sum(colhas(colmap.get(p, ""), v) for p in used)) for k, v in COLS.items()))
 
-    # ================= 4. switch 平台表(manual_reason) =================
-    out("")
-    out("################ 4 switch 平台表 manual_reason 匹配 ################")
-    sw_files = cat[cat.cols.str.contains("manual_reason", case=False) & cat.path.str.lower().str.endswith(".csv")].drop_duplicates(["fname", "size_mb"]).path.tolist()
-    E["sw"] = False; E["swreason"] = ""
+    # ================= 4. switch 平台表 + processing_data 表：按 VIN+时间匹配事件，合并可用列 =================
     win = {v: np.sort(g.sec.values.astype(np.int64)) for v, g in E.groupby("vin")}
-    hits, nerr, swrows, swreason_all, swmode = [], 0, 0, {}, {}
-    for k, p in enumerate(sw_files, 1):
-        try:
-            enc = "utf-8-sig"
+    TCOL = ("time", "position_time", "positiontime", "position_time_sql", "dis_engage_time", "disengage_time", "gps_time",
+            "timestamp", "switch_time", "create_time")
+
+    def match_tables(files, extra=None, tol=60, tag=""):
+        """读每个表的 vin/时间(和 extra 列)，按 0/±8h 取命中最多的偏移，返回 (命中表 DataFrame, 读失败数, 全表 extra 统计, 行数)"""
+        hits, nerr, stat, nrows = [], 0, {}, 0
+        for k, p in enumerate(files, 1):
             try:
-                hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
-                pd.read_csv(p, nrows=2000, encoding=enc, dtype=str)
-            except UnicodeDecodeError:
-                enc = "gbk"
-                hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
-            cv = next((c for c in hdr if c.lower() in ("vin",)), None)
-            ct = next((c for c in hdr if c.lower() in ("time", "switch_time", "create_time")), None)
-            cr = next((c for c in hdr if c.lower() == "manual_reason"), None)
-            if not (cv and ct and cr):
-                continue
-            cm = next((c for c in hdr if c.lower() == "drive_mode_switch"), None)
-            for ch in pd.read_csv(p, usecols=[c for c in (cv, ct, cr, cm) if c], dtype=str, chunksize=1_000_000, encoding=enc,
-                                  encoding_errors="replace", on_bad_lines="skip"):
-                swrows += len(ch)
-                for a, b in ch[cr].dropna().astype(str).str.strip().replace("", np.nan).dropna().value_counts().items():
-                    swreason_all[a] = swreason_all.get(a, 0) + b
-                if cm:
-                    for a, b in ch[cm].astype(str).value_counts().items():
-                        swmode[a] = swmode.get(a, 0) + b
-                ch = ch[ch[cv].isin(win.keys())]
-                if not len(ch):
+                enc = "utf-8-sig"
+                if p.lower().endswith(".csv"):
+                    try:
+                        hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
+                        pd.read_csv(p, nrows=2000, encoding=enc, dtype=str)
+                    except UnicodeDecodeError:
+                        enc = "gbk"; hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
+                else:
+                    hdr = pd.read_excel(p, nrows=0).columns
+                cv = next((c for c in hdr if str(c).strip().lower() in ("vin", "vin_x", "t2.vin")), None)
+                ct = next((c for k2 in TCOL for c in hdr if str(c).strip().lower() == k2), None)
+                ce = [c for c in hdr if extra and str(c).strip().lower() in extra]
+                if not (cv and ct):
                     continue
-                s = to_sec(ch[ct]).values
-                for sh in SHIFTS:
-                    tt = s + sh
-                    for v, idx in ch.groupby(cv).indices.items():
-                        a = win[v]; x = tt[idx]
-                        i = np.clip(np.searchsorted(a, x), 1, len(a) - 1) if len(a) > 1 else np.zeros(len(x), int)
-                        near = np.where(np.abs(a[i] - x) < np.abs(a[np.maximum(i - 1, 0)] - x), a[i], a[np.maximum(i - 1, 0)])
-                        ok = np.abs(near - x) <= 60
-                        for j in np.where(ok)[0]:
-                            hits.append((v, int(near[j]), sh, str(ch[cr].values[idx[j]]), abs(near[j] - x[j])))
-        except Exception as e:
-            nerr += 1
-            if nerr <= 3:
-                out("  读失败 %s %s" % (os.path.basename(p)[:40], type(e).__name__))
-        if k % 50 == 0:
-            print("  ... switch %d/%d %.0fs" % (k, len(sw_files), time.time() - t0))
-    out("  switch 文件=%d 读失败=%d 总行数=%d ; 全部行中 manual_reason 非空=%d ; drive_mode_switch 取值: %s" % (
-        len(sw_files), nerr, swrows, sum(swreason_all.values()), "  ".join("%s:%d" % (a, b) for a, b in sorted(swmode.items(), key=lambda x: -x[1])[:5])))
-    if swreason_all:
-        out("  全部行 manual_reason 取值(前10): " + "  ".join("%s:%d" % (a[:20], b) for a, b in sorted(swreason_all.items(), key=lambda x: -x[1])[:10]))
-    if hits:
-        H = pd.DataFrame(hits, columns=["vin", "sec", "shift", "reason", "dt"])
-        bs = H.groupby("shift").size().idxmax()
-        H = H[H["shift"] == bs].sort_values("dt").drop_duplicates(["vin", "sec"])
-        m = E.merge(H[["vin", "sec", "reason"]], on=["vin", "sec"], how="left")["reason"]
-        E["sw"] = m.notna().values
-        E["swreason"] = m.fillna("").values
-        rr = E.loc[E.sw, "swreason"].replace({"nan": "", "None": ""})
-        E["swreason_ok"] = E.sw & rr.reindex(E.index).fillna("").str.strip().ne("")
-        out("  switch 文件=%d  偏移=%+dh  匹配事件=%d  其中 manual_reason 非空=%d" % (len(sw_files), bs // 3600, E.sw.sum(), E.swreason_ok.sum()))
-        out("  manual_reason 取值(前10): " + "  ".join("%s:%d" % (a[:20], b) for a, b in rr[rr.str.strip() != ""].value_counts().head(10).items()))
-        out("  按等级匹配数: " + "  ".join("%s:%d/%d" % (lv, g.sw.sum(), len(g)) for lv, g in E.groupby("等级")))
-    else:
-        E["swreason_ok"] = False
-        out("  switch 文件=%d  未匹配到事件" % len(sw_files))
+                it = pd.read_csv(p, usecols=[cv, ct] + ce, dtype=str, chunksize=1_000_000, encoding=enc, encoding_errors="replace",
+                                 on_bad_lines="skip") if p.lower().endswith(".csv") else [pd.read_excel(p, usecols=[cv, ct] + ce, dtype=str)]
+                for ch in it:
+                    nrows += len(ch)
+                    for c in ce:
+                        vc = ch[c].dropna().astype(str).str.strip()
+                        for a, b in vc[vc != ""].value_counts().items():
+                            stat.setdefault(str(c).lower(), {})[a] = stat.setdefault(str(c).lower(), {}).get(a, 0) + b
+                    ch = ch[ch[cv].astype(str).str.upper().str.strip().isin(win.keys())]
+                    if not len(ch):
+                        continue
+                    vv = ch[cv].astype(str).str.upper().str.strip().values
+                    s = to_sec(ch[ct]).values
+                    ex = ch[ce[0]].astype(str).values if ce else np.array([""] * len(ch))
+                    for sh in SHIFTS:
+                        tt = s + sh
+                        for v in np.unique(vv):
+                            idx = np.where(vv == v)[0]; a = win[v]; x = tt[idx]
+                            ok0 = ~np.isnan(x)
+                            idx, x = idx[ok0], x[ok0]
+                            if not len(x):
+                                continue
+                            i = np.clip(np.searchsorted(a, x), 0, len(a) - 1)
+                            i2 = np.clip(i - 1, 0, len(a) - 1)
+                            near = np.where(np.abs(a[i] - x) <= np.abs(a[i2] - x), a[i], a[i2])
+                            ok = np.abs(near - x) <= tol
+                            for j in np.where(ok)[0]:
+                                hits.append((v, int(near[j]), sh, p, ex[idx[j]], abs(near[j] - x[j])))
+            except Exception as e:
+                nerr += 1
+                if nerr <= 3:
+                    out("  读失败 %s %s" % (os.path.basename(p)[:40], type(e).__name__))
+            if k % 50 == 0:
+                print("  ... %s %d/%d %.0fs" % (tag, k, len(files), time.time() - t0))
+        H = pd.DataFrame(hits, columns=["vin", "sec", "shift", "file", "extra", "dt"])
+        if len(H):   # 每个文件取命中最多的偏移
+            best = H.groupby(["file", "shift"]).size().reset_index(name="n").sort_values("n").drop_duplicates("file", keep="last")
+            H = H.merge(best[["file", "shift"]], on=["file", "shift"]).sort_values("dt")
+        return H, nerr, stat, nrows
+
+    out("")
+    out("################ 4 switch 平台表 ################")
+    sw_files = cat[cat.cols.str.contains("drive_mode_switch|manual_reason", case=False) & cat.path.str.lower().str.endswith(".csv")] \
+        .drop_duplicates(["fname", "size_mb"]).path.tolist()
+    HS, nerr, st, nrow = match_tables(sw_files, extra=("manual_reason", "drive_mode_switch"), tag="switch")
+    mr, dm = st.get("manual_reason", {}), st.get("drive_mode_switch", {})
+    out("  文件=%d 读失败=%d 行=%d ; 全表 manual_reason 非空=%d ; drive_mode_switch 取值: %s" % (
+        len(sw_files), nerr, nrow, sum(mr.values()), "  ".join("%s:%d" % (a, b) for a, b in sorted(dm.items(), key=lambda x: -x[1])[:5])))
+    if mr:
+        out("  manual_reason 取值(前10): " + "  ".join("%s:%d" % (a[:20], b) for a, b in sorted(mr.items(), key=lambda x: -x[1])[:10]))
+    E["sw"] = False; E["swreason_ok"] = False; E["_swcols"] = ""
+    if len(HS):
+        g1 = HS.drop_duplicates(["vin", "sec"])
+        key = set(zip(g1.vin, g1.sec))
+        E["sw"] = [(v, int(s)) in key for v, s in zip(E.vin, E.sec)]
+        rs_ = HS[HS.extra.str.strip().replace({"nan": ""}).ne("")].drop_duplicates(["vin", "sec"])
+        key2 = set(zip(rs_.vin, rs_.sec))
+        E["swreason_ok"] = [(v, int(s)) in key2 for v, s in zip(E.vin, E.sec)]
+        out("  匹配事件=%d  其中 manual_reason 非空=%d ; 按等级: %s" % (E.sw.sum(), E.swreason_ok.sum(),
+            "  ".join("%s:%d/%d" % (lv, g.sw.sum(), len(g)) for lv, g in E.groupby("等级"))))
+
+    out("")
+    out("################ 4b processing_data：表头与事件匹配 ################")
+    pdt = cat[cat.path.str.contains("processing_data", case=False)].drop_duplicates(["fname", "size_mb"])
+    out("  processing_data 下表格=%d  表头种类=%d" % (len(pdt), pdt.cols.nunique()))
+    for sgn, n in pdt.cols.value_counts().head(8).items():
+        d0 = pdt[pdt.cols == sgn].path.iloc[0]
+        out("   (%d) %s" % (n, sgn[:300]))
+        out("        例: %s" % d0[-90:])
+    npys = [dict(path=p, **np_info(p)) for p in PDNPY]
+    if npys:
+        NP = pd.DataFrame(npys)
+        out("  processing_data 下 npy=%d ; 形状(前8): %s" % (len(NP), "  ".join("%s%s" % (os.path.basename(a)[:28], b) for a, b in zip(NP.path.head(8), NP["shape"].head(8)))))
+        NP.to_csv(OUT_DIR + r"\processing_data_npy.csv", index=False, encoding="utf-8-sig")
+    HP, nerr, _, nrow = match_tables(pdt.path.tolist(), tol=30, tag="processing_data")
+    pdcols = {}
+    if len(HP):
+        for (v, s_), g in HP.groupby(["vin", "sec"]):
+            pdcols[(v, s_)] = ",".join(colmap.get(f, "") for f in g.file.unique())
+    E["_pdcols"] = [pdcols.get((v, int(s)), "") for v, s in zip(E.vin, E.sec)]
+    E["有processing_data表"] = E["_pdcols"] != ""
+    out("  读失败=%d 行=%d ; 匹配事件(±30s)=%d ; 按等级: %s" % (nerr, nrow, E["有processing_data表"].sum(),
+        "  ".join("%s:%d/%d" % (lv, g["有processing_data表"].sum(), len(g)) for lv, g in E.groupby("等级"))))
+    if len(HP):
+        out("  命中最多的 processing_data 表: " + "  ".join("%s:%d" % (os.path.basename(a)[:30], b) for a, b in
+            HP.drop_duplicates(["vin", "sec", "file"]).file.value_counts().head(5).items()))
+    E["_cols"] = (E["_cols"] + "," + E["_pdcols"]).str.lower()
+    out("  合并 processing_data 后，事件可用列含 → " + "  ".join("%s:%d" % (k, E["_cols"].map(lambda x: colhas(x, v)).sum()) for k, v in COLS.items()))
 
     # ================= 5. VIN 是否有连续车端导出(运行里程/时长) =================
     lvi = cat[cat.path.str.contains("local_vehicle_info", case=False) & cat.path.str.lower().str.endswith(".csv")].drop_duplicates(["fname", "size_mb"]).path.tolist()
@@ -603,7 +697,7 @@ def main():
         OUT_DIR + r"\lvi_exposure.csv", index=False, encoding="utf-8-sig")
 
     # ================= 6. 字段映射与各等级覆盖 =================
-    has = lambda k: E["_cols"].str.contains(COLS[k], regex=True)
+    has = lambda k: E["_cols"].map(lambda x: colhas(x, COLS[k]))
     anytraj = E["有表格轨迹"] | E["有NPY轨迹"]
     rsp = E["json_participant"]
     tsa_ok = bool(len(T)) and bool(T.name.str.contains("vehicle_end|ttc", case=False).any())
@@ -612,13 +706,17 @@ def main():
         "dm_or_npy": (E["有表格轨迹"] & has("drive_mode")) | E["有NPY轨迹"] | E["在0920"],
         "anytraj_acc": anytraj,
         "ch1": E["ch1_可读"] > 0, "ch2": E["ch2_可读"] > 0, "ch3": E["ch3_可读"] > 0,
+        "ch2a": (E["ch2_可读"] > 0) & E["ch2_audio"],
+        "anyvid": (E["ch1_可读"] + E["ch2_可读"] + E["ch3_可读"]) > 0,
+        "anyvid_ext": ((E["ch1_可读"] > 0) | E["有龙门架(同VIN)"]),
+        "anytraj_or_e9": anytraj | E["在0920"],
         "ch1_ch2": (E["ch1_可读"] > 0) & ((E["ch2_可读"] > 0) | (E["ch3_可读"] > 0)),
         "gantry": E["有龙门架(同VIN)"], "rsp": rsp, "rsp_traj": rsp & anytraj, "rsp_conf": rsp & bool(rs_conf),
         "rsig": E["json_signal"], "revent": E["json_event"], "tsa": pd.Series(bool(tsa_ok), index=E.index) & E["轨迹_原始文件"].str.contains("运行安全评价", regex=False),
         "sw": E["sw"], "swreason": E["swreason_ok"], "lvi": E["lvi"],
     }
     for k in COLS:
-        COND["col:" + k] = E["有表格轨迹"] & has(k)
+        COND["col:" + k] = has(k)
     rows, per = [], {}
     for mod, f, pri in SPEC:
         rules = RULES[f]
@@ -641,8 +739,8 @@ def main():
             vc = act[idx].value_counts()
             main_a = vc.index[0]
             recs.append(dict(模块=mod, 字段=f, 优先级=pri, 主要动作=ACT[main_a], 主要来源=src[idx][act[idx] == main_a].iloc[0],
-                             现有即可=int(act[idx].isin(HAVE).sum()), 需人工标注=int((act[idx] == "V").sum()), 需外部数据=int((act[idx] == "X").sum()),
-                             需企业提供=int((act[idx] == "Q").sum()), 无法补充=int((act[idx] == "N").sum()),
+                             现有即可=int(act[idx].isin(HAVE).sum()), 模型恢复=int((act[idx] == "M").sum()), 人工审计=int((act[idx] == "V").sum()),
+                             外部地图=int((act[idx] == "X").sum()), 外部气象=int((act[idx] == "W").sum()), 无法补充=int((act[idx] == "N").sum()),
                              可覆盖率=round(act[idx].isin(ABLE).mean(), 3), 事件数=len(idx)))
         tables[lv] = pd.DataFrame(recs)
     xl = OUT_DIR + r"\字段映射表.xlsx"
@@ -663,13 +761,13 @@ def main():
 
     out("")
     out("################ 6 各等级: 110 个字段按主要动作计数 (P0 共 %d 个) ################" % sum(p == "P0" for _, _, p in SPEC))
-    out("  等级     事件 | P0: 现有 人工 外部 企业 无法 | 全部: 现有 人工 外部 企业 无法")
+    out("  等级     事件 | P0: 现有 模型 人工 地图 气象 无法 | 全部: 现有 模型 人工 地图 气象 无法")
     for lv, t in tables.items():
         c0 = t[t["优先级"] == "P0"]["主要动作"].value_counts(); ca = t["主要动作"].value_counts()
-        cnt = lambda c: (sum(c.get(ACT[a], 0) for a in HAVE), c.get(ACT["V"], 0), c.get(ACT["X"], 0), c.get(ACT["Q"], 0), c.get(ACT["N"], 0))
-        out("  %-7s %5d | %8d %4d %4d %4d %4d | %10d %4d %4d %4d %4d" % ((lv, t["事件数"].iloc[0]) + cnt(c0) + cnt(ca)))
+        cnt = lambda c: (sum(c.get(ACT[a], 0) for a in HAVE),) + tuple(c.get(ACT[a], 0) for a in ("M", "V", "X", "W", "N"))
+        out("  %-7s %5d | %8d %4d %4d %4d %4d %4d | %10d %4d %4d %4d %4d %4d" % ((lv, t["事件数"].iloc[0]) + cnt(c0) + cnt(ca)))
     out("")
-    out("  各模块 P0 字段在各等级的主要动作(首字母 D/C/L/R=现有, V=人工, X=外部, Q=企业, N=无法):")
+    out("  P0 字段在各等级的主要动作与可覆盖率(D/C/L/R=现有, M=模型, V=人工, X=地图, W=气象, N=无法):")
     inv = {v: k for k, v in ACT.items()}
     hdr = "  %-24s" % "字段" + "".join("%-8s" % lv for lv in levels)
     out(hdr)
