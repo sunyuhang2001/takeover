@@ -29,7 +29,7 @@
 | 11_event_lists.py | v2 | 774543e1 |
 | **12_verify_all.py** | v5 | 345d8773 |
 | **13_diag_notraj.py** | v1 | 33d86ff1 |
-| **14_roadside_fields.py** | v4 | 0d3e5db3 |
+| **14_roadside_fields.py** | v5 | 8da25a5d |
 | **15_audio_probe.py** | v2 | eb94680d |
 | **16_gantry_locate.py** | v1 | 7cb33649 |
 
