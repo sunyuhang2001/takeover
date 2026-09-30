@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 14_roadside_fields.py v1 : 路侧数据统计 + 理想字段表(V2.04, 110 个字段)与现有数据的映射 + 各等级补充方案（只读）
+# 14_roadside_fields.py v2 : 路侧数据统计 + 理想字段表(V2.04, 110 个字段)与现有数据的映射 + 各等级补充方案（只读）
 #   输入: 12 的 事件资产表.csv / 事件资产表_2025.csv、04 的 table_catalog.csv；重新扫盘找龙门架视频与路侧 json
 #   [1] 路侧: 龙门架视频(案例目录/路口/相机/分辨率/时长) 与 路侧 json(各类型文件/时段/字段样例/频率)
 #   [2] 事件层面: 每个等级(A–H/X, 2025 单列)有龙门架 / 有 json 的事件
@@ -12,7 +12,7 @@ import os, sys, re, json, hashlib, time
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "14_roadside_fields", "v1"
+NAME, VERSION = "14_roadside_fields", "v2"
 BASE = r"D:\takeover_audit"
 IN12 = BASE + r"\12_verify"
 CATALOG = BASE + r"\04_tables\table_catalog.csv"
@@ -513,16 +513,30 @@ def main():
     sw_files = cat[cat.cols.str.contains("manual_reason", case=False) & cat.path.str.lower().str.endswith(".csv")].drop_duplicates(["fname", "size_mb"]).path.tolist()
     E["sw"] = False; E["swreason"] = ""
     win = {v: np.sort(g.sec.values.astype(np.int64)) for v, g in E.groupby("vin")}
-    hits = []
+    hits, nerr, swrows, swreason_all, swmode = [], 0, 0, {}, {}
     for k, p in enumerate(sw_files, 1):
         try:
-            hdr = pd.read_csv(p, nrows=0, encoding="utf-8-sig").columns
+            enc = "utf-8-sig"
+            try:
+                hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
+                pd.read_csv(p, nrows=2000, encoding=enc, dtype=str)
+            except UnicodeDecodeError:
+                enc = "gbk"
+                hdr = pd.read_csv(p, nrows=0, encoding=enc).columns
             cv = next((c for c in hdr if c.lower() in ("vin",)), None)
             ct = next((c for c in hdr if c.lower() in ("time", "switch_time", "create_time")), None)
             cr = next((c for c in hdr if c.lower() == "manual_reason"), None)
             if not (cv and ct and cr):
                 continue
-            for ch in pd.read_csv(p, usecols=[cv, ct, cr], dtype=str, chunksize=1_000_000, encoding="utf-8-sig", on_bad_lines="skip"):
+            cm = next((c for c in hdr if c.lower() == "drive_mode_switch"), None)
+            for ch in pd.read_csv(p, usecols=[c for c in (cv, ct, cr, cm) if c], dtype=str, chunksize=1_000_000, encoding=enc,
+                                  encoding_errors="replace", on_bad_lines="skip"):
+                swrows += len(ch)
+                for a, b in ch[cr].dropna().astype(str).str.strip().replace("", np.nan).dropna().value_counts().items():
+                    swreason_all[a] = swreason_all.get(a, 0) + b
+                if cm:
+                    for a, b in ch[cm].astype(str).value_counts().items():
+                        swmode[a] = swmode.get(a, 0) + b
                 ch = ch[ch[cv].isin(win.keys())]
                 if not len(ch):
                     continue
@@ -537,9 +551,15 @@ def main():
                         for j in np.where(ok)[0]:
                             hits.append((v, int(near[j]), sh, str(ch[cr].values[idx[j]]), abs(near[j] - x[j])))
         except Exception as e:
-            out("  读失败 %s %r" % (os.path.basename(p), e))
+            nerr += 1
+            if nerr <= 3:
+                out("  读失败 %s %s" % (os.path.basename(p)[:40], type(e).__name__))
         if k % 50 == 0:
             print("  ... switch %d/%d %.0fs" % (k, len(sw_files), time.time() - t0))
+    out("  switch 文件=%d 读失败=%d 总行数=%d ; 全部行中 manual_reason 非空=%d ; drive_mode_switch 取值: %s" % (
+        len(sw_files), nerr, swrows, sum(swreason_all.values()), "  ".join("%s:%d" % (a, b) for a, b in sorted(swmode.items(), key=lambda x: -x[1])[:5])))
+    if swreason_all:
+        out("  全部行 manual_reason 取值(前10): " + "  ".join("%s:%d" % (a[:20], b) for a, b in sorted(swreason_all.items(), key=lambda x: -x[1])[:10]))
     if hits:
         H = pd.DataFrame(hits, columns=["vin", "sec", "shift", "reason", "dt"])
         bs = H.groupby("shift").size().idxmax()
