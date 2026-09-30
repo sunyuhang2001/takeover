@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 15_audio_probe.py v1 : 自车视频音轨探查 + 接管提示音检测（只读，不需要喇叭）
+# 15_audio_probe.py v2 : 自车视频音轨探查 + 接管提示音检测（只读，不需要喇叭）
 #   [1] 全部 ch1/ch2/ch3 视频: 音频编码格式统计(读文件头 strf/WAVEFORMATEX)
 #   [2] 全盘找 ffmpeg.exe(压缩音频 MP3/AAC 需要它解码)
 #   [3] 抽样事件(默认 6 个 0920 事件, 优先座舱 ch2): 解码音频 -> 频谱 -> 检测“嘀”声(窄带、稳定频率)
@@ -10,7 +10,7 @@ import os, sys, re, struct, hashlib, time, subprocess
 import numpy as np
 import pandas as pd
 
-NAME, VERSION = "15_audio_probe", "v1"
+NAME, VERSION = "15_audio_probe", "v2"
 BASE = r"D:\takeover_audit"
 IN12 = BASE + r"\12_verify"
 OUT_DIR = BASE + r"\15_audio"
@@ -19,7 +19,9 @@ SKIP = {"windows", "$recycle.bin", "system volume information", "node_modules", 
 RE_EGO = re.compile(r"ch([123])_(\d{12})_(\d{12})", re.I)
 FMT = {1: "PCM", 2: "MS-ADPCM", 3: "IEEE-float", 6: "A-law", 7: "mu-law", 0x11: "IMA-ADPCM", 0x31: "GSM610",
        0x45: "G726", 0x55: "MP3", 0xFF: "AAC", 0x1610: "AAC", 0x2000: "AC3"}
-BAND = (300, 6000)       # 提示音搜索频段 Hz
+BAND = (800, 4000)       # 提示音搜索频段 Hz（v1 的 300-550Hz 是车内持续嗡声）
+HUM = 0.2                # 某频率在整段 >20% 的帧里都是峰 → 视为底噪
+WIN_EVT = (-10, 3)       # 统计窗: 接管前 10s ~ 后 3s
 WIN = 0.05               # 50 ms 窗
 
 
@@ -183,14 +185,18 @@ def beeps(t, f, S):
     band = (f >= BAND[0]) & (f <= min(BAND[1], f[-1]))
     B = S[:, band]; fb = f[band]
     pk = B.argmax(axis=1); prom = B.max(axis=1) - np.median(B, axis=1)
-    on = prom >= 18
+    on = prom >= 15
+    if on.any():   # 去掉持续底噪频率(±1 个频点)
+        occ = np.bincount(pk[on], minlength=len(fb)) / len(on)
+        hum = np.convolve(occ, np.ones(3), "same") > HUM
+        on &= ~hum[pk]
     ev, i = [], 0
     while i < len(on):
         if on[i]:
             j = i
             while j + 1 < len(on) and on[j + 1] and abs(fb[pk[j + 1]] - fb[pk[i]]) <= 60:
                 j += 1
-            if j - i + 1 >= 3:
+            if 3 <= j - i + 1 and t[j] - t[i] <= 3:
                 ev.append((t[i], t[j], float(np.median(fb[pk[i:j + 1]])), float(prom[i:j + 1].mean())))
             i = j + 1
         else:
@@ -245,7 +251,7 @@ def walk_find(roots, names):
 
 def main():
     t0 = time.time()
-    nsample = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 6
+    nsample = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 30
     os.makedirs(OUT_DIR, exist_ok=True)
     out("=== %s %s  check=%s  %s ===" % (NAME, VERSION, selfcheck(), time.strftime("%Y-%m-%d %H:%M")))
     U = pd.read_csv(IN12 + r"\事件资产表.csv", dtype={"vin": str}, encoding="utf-8-sig")
@@ -266,14 +272,14 @@ def main():
                                                    for k, v in sorted(cnt.items(), key=lambda x: -x[1]))))
 
     # [2] ffmpeg
-    ff = walk_find(ROOTS, ("ffmpeg",))
+    ff = walk_find(ROOTS, ("ffmpeg",)) if "--ffmpeg" in sys.argv else []
     out("")
-    out("[2] 找到 ffmpeg: %d 个 %s" % (len(ff), " | ".join(ff[:4])))
+    out("[2] ffmpeg: %s" % ((" | ".join(ff[:4]) or "未找到") if "--ffmpeg" in sys.argv else "未搜索(PCM 不需要；加 --ffmpeg 才搜)"))
     ffmpeg = next((p for p in ff if os.path.basename(p).lower().startswith("ffmpeg")), None)
 
     # [3] 抽样检测
     out("")
-    out("[3] 抽样提示音检测(频段 %d-%dHz, 窄带峰值高出中位 >=18dB 且持续 >=75ms 记为一声)" % BAND)
+    out("[3] 抽样提示音检测(频段 %d-%dHz, 窄带峰值高出中位 >=15dB、持续 75ms~3s、排除持续底噪频率 记为一声)" % BAND)
     U["事件时间"] = pd.to_datetime(U["事件时间"])
     cand = U[(U["ch2_可读"].fillna(0) > 0) & (U["在0920"].astype(str).str.lower() == "true")]
     if len(cand) < nsample:
@@ -292,11 +298,10 @@ def main():
                     continue
                 s = pd.to_datetime(m.group(2), format="%y%m%d%H%M%S", errors="coerce")
                 e = pd.to_datetime(m.group(3), format="%y%m%d%H%M%S", errors="coerce")
-                if pd.notna(s) and s - pd.Timedelta(seconds=5) <= r["事件时间"] <= e + pd.Timedelta(seconds=5):
+                if pd.notna(s) and s + pd.Timedelta(seconds=3) <= r["事件时间"] <= e - pd.Timedelta(seconds=1):
                     best = (p, s); break
-                best = best or (p, s)
             if not best:
-                continue
+                out("  %s_ch%s  片段不覆盖接管时刻，跳过" % (r["event_key"][-15:], c)); continue
             p, s = best
             x, sr, how = decode(p, ffmpeg)
             key = "%s_ch%s" % (r["event_key"][-15:], c)
@@ -308,20 +313,34 @@ def main():
             ev = beeps(t, f, S)
             te = (r["事件时间"] - s).total_seconds() if pd.notna(s) else None
             rel = [a - te for a, *_ in ev] if te is not None else []
-            before = [v for v in rel if -30 <= v <= 1]
+            before = [v for v in rel if WIN_EVT[0] <= v <= WIN_EVT[1]]
             freqs = sorted(set(int(round(fq / 50) * 50) for *_, fq, _ in ev))
-            rows.append(dict(事件=key, 格式=how, 采样率=sr, 时长s=round(len(x) / sr, 1), 提示音数=len(ev),
-                             接管前30s内=len(before), 首声相对接管s=round(min(before), 1) if before else None,
+            fwin = [fq for (a, b, fq, _), v in zip(ev, rel) if WIN_EVT[0] <= v <= WIN_EVT[1]]
+            desc = str(r.get("描述", ""))
+            rows.append(dict(事件=key, 类别=str(r.get("类别", ""))[:1], 格式=how, 采样率=sr, 时长s=round(len(x) / sr, 1), 提示音数=len(ev),
+                             窗内=len(before), 窗内主频=int(round(np.median(fwin) / 50) * 50) if fwin else None,
+                             主动接管=bool(re.search("安全员|主动|人工|手动|观察|减速缓行|掉头", desc)), 描述=desc[:40], 首声相对接管s=round(min(before), 1) if before else None,
                              频率Hz=",".join(map(str, freqs[:6])), 平均单声s=round(np.mean([b - a for a, b, *_ in ev]), 2) if ev else None))
             png = OUT_DIR + "\\spec_%s.png" % key
             plot(t, f, S, ev, te, "%s  %s  %s  提示音=%d" % (key, r.get("类别", "")[:1], how, len(ev)), png)
-            out("  %s  %-10s %5.1fs  提示音=%3d  接管前30s内=%2d  首声相对接管=%s  频率=%s" % (
-                key, how, len(x) / sr, len(ev), len(before), rows[-1]["首声相对接管s"], rows[-1]["频率Hz"]))
-            desc = str(r.get("描述", ""))
+            out("  %s  %s  提示音=%3d  窗内=%2d  首声相对接管=%s  窗内主频=%s  全段频率=%s" % (
+                key, rows[-1]["类别"], len(ev), len(before), rows[-1]["首声相对接管s"], rows[-1]["窗内主频"], rows[-1]["频率Hz"]))
             if desc and desc != "nan":
                 out("      0920描述: %s" % desc[:60])
             break
-    pd.DataFrame(rows).to_csv(OUT_DIR + r"\beeps.csv", index=False, encoding="utf-8-sig")
+    R = pd.DataFrame(rows)
+    R.to_csv(OUT_DIR + r"\beeps.csv", index=False, encoding="utf-8-sig")
+    ok = R[R["提示音数"] >= 0] if len(R) else R
+    if len(ok):
+        out("")
+        out("[4] 汇总: 可分析=%d  接管前%ds~后%ds 有提示音=%d (%.0f%%)" % (len(ok), -WIN_EVT[0], WIN_EVT[1], (ok["窗内"] > 0).sum(), 100 * (ok["窗内"] > 0).mean()))
+        h = ok[ok["窗内"] > 0]
+        if len(h):
+            out("    首声相对接管(s): 中位=%.1f  范围 %.1f ~ %.1f ; 窗内声数 中位=%d ; 窗内主频: %s" % (
+                h["首声相对接管s"].median(), h["首声相对接管s"].min(), h["首声相对接管s"].max(), h["窗内"].median(),
+                "  ".join("%s:%d" % (a, b) for a, b in h["窗内主频"].value_counts().head(5).items())))
+        for lab, g in ok.groupby("主动接管"):
+            out("    描述%s安全员主动/观察类: 事件=%d  窗内有提示音=%d" % ("含" if lab else "不含", len(g), (g["窗内"] > 0).sum()))
     out("")
     out("  时频图: %s\\spec_*.png (横线=检测到的提示音, 绿色虚线=接管时刻)" % OUT_DIR)
     open(OUT_DIR + r"\summary.txt", "w", encoding="utf-8").write("\n".join(L))

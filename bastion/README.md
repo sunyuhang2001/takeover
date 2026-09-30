@@ -30,7 +30,7 @@
 | **12_verify_all.py** | v5 | 345d8773 |
 | **13_diag_notraj.py** | v1 | 33d86ff1 |
 | **14_roadside_fields.py** | v3 | 1e09a1ff |
-| **15_audio_probe.py** | v1 | f2dd8bd9 |
+| **15_audio_probe.py** | v2 | eb94680d |
 
 堡垒机上的 Python：`D:\miniconda3\envs\process\python.exe`（3.10.9，已装 pandas 1.5.3、openpyxl、cv2、matplotlib）。
 
